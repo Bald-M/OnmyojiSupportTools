@@ -1,3 +1,3 @@
-packages:
-  - 'apps/*'
-  - 'apps/packages/*'
+# pnpm 11 keeps dependency build-script policy here; there are no workspace package globs.
+allowBuilds:
+  esbuild: true
