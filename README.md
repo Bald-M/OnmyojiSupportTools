@@ -24,7 +24,7 @@ OnmyojiSupportTools 是一个面向 Windows 的 Android 模拟器辅助桌面应
 | WebView | NSIS 安装包可按需调用微软 WebView2 引导程序；便携版要求系统已安装 WebView2 Runtime |
 | ADB | 由用户提供；可使用模拟器自带 ADB 或 Android SDK Platform-Tools |
 
-macOS 目前不在构建和支持范围内。核心模块保留跨平台边界，待 Windows 版本稳定后再评估适配。
+macOS 目前不提供应用产物或运行支持。macOS 开发机可以交叉编译 Windows 便携产物；核心模块继续保留平台边界，待 Windows 版本稳定后再评估原生 macOS 适配。
 
 ### 构建目标
 
@@ -46,16 +46,16 @@ ARM64 产物中的应用程序是原生 ARM64 PE；按照 [Tauri Windows 安装�
 
 ## 本地开发
 
-开发环境需要 Node.js 22.12 或更高版本、pnpm 11.19、Rust stable、Visual Studio C++ Build Tools 和 WebView2 开发环境。
+通用开发环境需要 Node.js 22.12 或更高版本、pnpm 11.19 和 Rust stable。Windows 原生打包需要 Visual Studio C++ Build Tools 和 WebView2 开发环境。
 
-```powershell
+```shell
 pnpm install --frozen-lockfile
 pnpm dev
 ```
 
 常用检查命令：
 
-```powershell
+```shell
 pnpm lint
 pnpm typecheck
 pnpm test
@@ -66,9 +66,16 @@ pnpm build:windows:x64     # Windows x64
 pnpm build:windows:arm64   # Windows ARM64
 ```
 
-桌面打包命令只在 Windows 上运行；使用 macOS 开发时，请推送分支后由 GitHub Actions 生成 Windows x64 与 ARM64 产物。
+构建入口会根据宿主系统选择工具链：Windows 使用原生 MSVC，macOS 使用 `cargo-xwin` 交叉编译 Windows MSVC 目标。首次在 macOS 构建前安装依赖：
 
-`pnpm check` 会执行前端 lint、类型检查和测试，以及 Rust 格式、Clippy 和测试。Windows ARM64 本地构建还需要 Visual Studio 的 C++ ARM64 build tools。构建脚本会安装对应 Rust target、调用 Tauri、检查最终 PE Header，并生成带平台和架构的统一产物：
+```shell
+brew install llvm
+cargo install --locked cargo-xwin
+```
+
+脚本会自动发现 Homebrew 的 LLVM 路径，无需修改 `~/.zshrc`。macOS 交叉构建会校验 PE 架构并生成便携 ZIP，但不生成 NSIS 安装包；安装包由 Windows 原生构建或 GitHub Actions 生成。这只生成 Windows 应用，不代表支持在 macOS 上运行该应用。Tauri 官方将 macOS/Linux 交叉构建标记为带限制的备用方案；正式产物仍以 GitHub Actions 的原生 Windows runner 为准。
+
+`pnpm check` 会执行构建调度器测试、前端 lint、类型检查和测试，以及 Rust 格式、Clippy 和测试。Windows ARM64 原生构建还需要 Visual Studio 的 C++ ARM64 build tools。构建脚本会安装对应 Rust target、调用 Tauri、检查最终 PE Header，并生成带平台和架构的统一产物：
 
 ```text
 artifacts/windows-x64/

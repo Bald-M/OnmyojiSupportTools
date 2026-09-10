@@ -33,7 +33,7 @@ docs: explain portable WebView2 requirement
 
 ## 提交前检查
 
-```powershell
+```shell
 pnpm install --frozen-lockfile
 pnpm check
 pnpm frontend:build
@@ -41,7 +41,7 @@ pnpm build:windows:x64
 pnpm build:windows:arm64
 ```
 
-两个桌面构建都需要 Windows 构建环境，ARM64 还需要 Visual Studio C++ ARM64 build tools。若本机不是 Windows，请至少完成前三项，并在 PR 中说明未执行的架构；CI 会在对应原生 Windows runner 上构建。
+Windows 上的两个桌面构建使用原生 MSVC，ARM64 还需要 Visual Studio C++ ARM64 build tools。macOS 可先执行 `brew install llvm` 和 `cargo install --locked cargo-xwin`，再通过相同命令交叉编译便携 ZIP；NSIS 安装包仍由原生 Windows 或 CI 构建。若未执行某个架构，请在 PR 中说明，CI 会在对应原生 Windows runner 上复核。
 
 涉及设备流程时，按影响范围执行 [Windows 验收矩阵](docs/windows-acceptance.md)：自动/手动 ADB、单/多设备、IP 连接、截图、缩放取点、点击，以及离线、未授权和超时恢复。
 

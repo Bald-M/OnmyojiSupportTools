@@ -3,6 +3,7 @@ artifacts/
 dist/
 src-tauri/target/
 src-tauri/gen/
+.xwin-cache/
 .DS_Store
 *.log
 .idea/

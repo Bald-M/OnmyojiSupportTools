@@ -17,6 +17,7 @@
 - 新增明暗主题、键盘坐标输入、可见焦点、禁用状态和可恢复错误反馈。
 - 新增 Rust 与 Vue 自动化测试、Windows CI、NSIS 与便携 ZIP 构建产物。
 - 新增 Windows x64 与 Windows ARM64 的显式构建命令、原生 CI runner 和 PE 架构校验。
+- 新增跨平台 Windows 构建调度器，在 Windows 使用原生 MSVC，并允许 macOS 通过 `cargo-xwin` 构建 x64 与 ARM64 便携产物。
 - 新增 README、贡献指南、领域词汇、ADR、PR 模板和 Bug/Feature Issue Forms。
 
 ### Changed
@@ -24,7 +25,7 @@
 - 仓库从 Lerna/pnpm 多包结构扁平化为根目录 Vue `src/` 与 Rust `src-tauri/`。
 - 移除 Koa HTTP 后端和浏览器部署路径，所有设备能力改由受控 Tauri IPC 暴露。
 - 工程版本统一为 `0.1.0`，根包设为私有，许可证元数据统一为 MIT。
-- 桌面支持范围明确为 Windows 10 22H2 与 Windows 11 x64；macOS 暂不构建或支持。
+- 桌面支持范围明确为 Windows 10 22H2 与 Windows 11 x64；macOS 暂不提供应用产物或运行支持。
 - 构建产物统一使用包含版本、平台和架构的文件名；Windows ARM64 暂列为实验性目标。
 
 ### Fixed
@@ -33,6 +34,7 @@
 - 修复切换设备后旧截图仍可能参与点击校验的问题。
 - 修复 ADB 连接退出码成功但输出文本报告连接失败时未返回错误的问题。
 - 修复重复截图时旧 Object URL 未及时释放造成的内存增长风险。
+- 修复 macOS 执行 `pnpm build` 时因硬编码调用 PowerShell 而立即失败的问题。
 
 ### Performance
 
