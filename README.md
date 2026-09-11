@@ -19,21 +19,18 @@ OnmyojiSupportTools 是一个面向 Windows 的 Android 模拟器辅助桌面应
 
 | 项目 | 支持范围 |
 | --- | --- |
-| Windows | Windows 10 22H2 / Windows 11 x64；Windows 11 ARM64 为实验性构建目标 |
+| Windows | Windows 10 22H2 / Windows 11 x64 |
 | 模拟器 | MuMu 模拟器 12、雷电模拟器 9 |
-| WebView | NSIS 安装包可按需调用微软 WebView2 引导程序；便携版要求系统已安装 WebView2 Runtime |
+| WebView | NSIS 安装包可按需调用微软 WebView2 引导程序 |
 | ADB | Windows 安装包内置 AOSP ADB 37.0.1；也可改用模拟器或 Android SDK 提供的外部 ADB |
 
-macOS 目前不提供应用产物或运行支持。macOS 开发机可以交叉编译 Windows 便携产物；核心模块继续保留平台边界，待 Windows 版本稳定后再评估原生 macOS 适配。
+macOS 目前不提供原生应用或运行支持，但开发机可以交叉编译 Windows x64 NSIS 安装包；核心模块继续保留平台边界，待 Windows 版本稳定后再评估原生 macOS 适配。
 
 ### 构建目标
 
 | 平台 | 架构 | Rust target | CI runner | 状态 |
 | --- | --- | --- | --- | --- |
 | Windows | x64 | `x86_64-pc-windows-msvc` | `windows-2025` | 主要支持目标 |
-| Windows | ARM64 | `aarch64-pc-windows-msvc` | `windows-11-arm` | 实验性，需继续完成真机和模拟器验收 |
-
-ARM64 产物中的应用程序是原生 ARM64 PE；按照 [Tauri Windows 安装包说明](https://v2.tauri.app/distribute/windows-installer/)，NSIS 安装器本身仍以 x86 运行，并由 Windows ARM 仿真执行。模拟器及其 ADB 是否支持 Windows ARM64 取决于各自厂商，不能由应用构建成功替代验证。
 
 ## 使用流程
 
@@ -62,29 +59,27 @@ pnpm test
 pnpm check
 pnpm frontend:build
 pnpm build                 # 默认：Windows x64
+pnpm build:windows         # Windows x64
 pnpm build:windows:x64     # Windows x64
-pnpm build:windows:arm64   # Windows ARM64
 ```
 
 构建入口会根据宿主系统选择工具链：Windows 使用原生 MSVC，macOS 使用 `cargo-xwin` 交叉编译 Windows MSVC 目标。首次在 macOS 构建前安装依赖：
 
 ```shell
-brew install llvm
+brew install llvm nsis
 cargo install --locked cargo-xwin
 ```
 
-脚本会自动发现 Homebrew 的 LLVM 路径，无需修改 `~/.zshrc`。构建会先取得固定的官方 Platform-Tools 37.0.1 归档，校验归档和安装文件的 SHA-256 后再打包；应用运行时不会下载 ADB。macOS 交叉构建会校验 PE 架构并生成包含 ADB 的诊断用便携 ZIP，但不能生成 NSIS 安装包；面向用户的可卸载安装包由 Windows 原生构建或 GitHub Actions 生成。这只生成 Windows 应用，不代表支持在 macOS 上运行该应用。
+脚本会自动发现 Homebrew 的 LLVM 路径，无需修改 `~/.zshrc`。构建会先取得固定的官方 Platform-Tools 37.0.1 归档，校验归档和安装文件的 SHA-256 后再打包；应用运行时不会下载 ADB。Windows 原生构建与 macOS 交叉构建都会校验 PE 架构并生成集成 ADB 的 NSIS 安装包。这只生成 Windows 应用，不代表支持在 macOS 上运行该应用。
 
-`pnpm check` 会执行构建调度器测试、前端 lint、类型检查和测试，以及 Rust 格式、Clippy 和测试。Windows ARM64 原生构建还需要 Visual Studio 的 C++ ARM64 build tools。构建脚本会安装对应 Rust target、调用 Tauri、检查最终 PE Header，并生成带平台和架构的统一产物：
+`pnpm check` 会执行构建调度器测试、前端 lint、类型检查和测试，以及 Rust 格式、Clippy 和测试。构建脚本会安装 x64 Rust target、调用 Tauri、检查最终 PE Header，并在完成后清空 `dist/`，只保留带版本、平台和架构的安装包：
 
 ```text
-artifacts/windows-x64/
+dist/
   OnmyojiSupportTools_0.1.0_windows_x64_nsis-setup.exe
-artifacts/windows-arm64/
-  OnmyojiSupportTools_0.1.0_windows_arm64_nsis-setup.exe
 ```
 
-CI 在原生 x64 和 ARM64 Windows runner 上分别构建并上传 NSIS 安装包；安装后可通过 Windows“已安装的应用”卸载。CI 不会自动创建 GitHub Release、签名或启用自动更新。macOS 本地交叉构建产生的便携 ZIP 仅用于开发验证，不作为用户发布物。
+CI 在原生 x64 Windows runner 上构建并上传同一个 NSIS 安装包；安装后可通过 Windows“已安装的应用”卸载。CI 不会自动创建 GitHub Release、签名或启用自动更新。
 
 ## 架构
 

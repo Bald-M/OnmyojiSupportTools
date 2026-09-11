@@ -12,7 +12,6 @@
     "build": "pnpm build:windows:x64",
     "build:windows": "pnpm build:windows:x64",
     "build:windows:x64": "node scripts/build-windows.mjs --architecture x64",
-    "build:windows:arm64": "node scripts/build-windows.mjs --architecture arm64",
     "prepare:adb": "node scripts/prepare-bundled-adb.mjs",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "vue-tsc --noEmit",

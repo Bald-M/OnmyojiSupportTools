@@ -1,5 +1,4 @@
 node_modules/
-artifacts/
 dist/
 src-tauri/target/
 src-tauri/gen/

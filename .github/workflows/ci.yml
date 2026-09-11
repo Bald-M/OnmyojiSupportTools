@@ -58,21 +58,9 @@ jobs:
         run: pnpm frontend:build
 
   build-windows:
-    name: Build · ${{ matrix.platform }} ${{ matrix.arch }}
+    name: Build · Windows x64
     needs: quality
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: windows
-            arch: x64
-            target: x86_64-pc-windows-msvc
-            runner: windows-2025
-          - platform: windows
-            arch: arm64
-            target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -82,7 +70,7 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
-          architecture: ${{ matrix.arch }}
+          architecture: x64
 
       - name: Set up pnpm
         run: npm install --global pnpm@11.19.0
@@ -91,7 +79,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup target add ${{ matrix.target }}
+          rustup target add x86_64-pc-windows-msvc
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -99,11 +87,11 @@ jobs:
       - name: Build and verify Windows bundle
         id: package
         shell: pwsh
-        run: pnpm build:windows:${{ matrix.arch }}
+        run: pnpm build:windows:x64
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
         with:
-          name: OnmyojiSupportTools-0.1.0-${{ matrix.platform }}-${{ matrix.arch }}-nsis
+          name: OnmyojiSupportTools-0.1.0-windows-x64-nsis
           path: ${{ steps.package.outputs.installer_path }}
           if-no-files-found: error

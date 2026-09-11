@@ -8,9 +8,8 @@
 | --- | --- | --- |
 | Windows 10 22H2 x64 | 待验证 | 待验证 |
 | Windows 11 x64 | 待验证 | 待验证 |
-| Windows 11 ARM64 | 待验证（取决于模拟器兼容性） | 待验证（取决于模拟器兼容性） |
 
-每个组合都应检查对应架构的 NSIS 安装包，并在没有 Android SDK、`PATH` 中没有 ADB 的干净环境中至少执行一次完整流程。ARM64 验收必须确认应用 PE 为 ARM64，同时记录模拟器和内置 ADB 自身是否能在该设备上运行；NSIS 安装器本身通过 Windows x86 仿真启动属于预期行为。
+每个组合都应检查 Windows x64 NSIS 安装包，并在没有 Android SDK、`PATH` 中没有 ADB 的干净环境中至少执行一次完整流程。
 
 ## 基础流程
 
@@ -39,6 +38,7 @@
 ## 安装、升级与卸载
 
 - [ ] x64 用户发布物只有带版本、平台和架构名称的 NSIS `.exe` 安装包。
+- [ ] 构建完成后 `dist/` 中只有该 NSIS 安装包，不存在旧安装包或便携 ZIP。
 - [ ] 安装目录包含 `adb.exe`、两个 ADB DLL、`NOTICE.txt`、`source.properties` 和 `PROVENANCE.json`。
 - [ ] Windows“已安装的应用”中存在卸载入口，正常卸载后应用安装目录及内置 ADB 文件被移除。
 - [ ] 升级或卸载不会删除 Android SDK、模拟器文件、用户手动选择的 ADB 或其他应用的数据。

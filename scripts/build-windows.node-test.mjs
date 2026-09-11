@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,7 +15,11 @@ import {
   assertBundledAdbResources,
   BUNDLED_ADB,
 } from "./prepare-bundled-adb.mjs";
-import { createBuildPlan } from "./build-windows.mjs";
+import {
+  createBuildPlan,
+  installerFileName,
+  replaceDistributionDirectory,
+} from "./build-windows.mjs";
 
 test("pins an auditable open-source ADB package for Windows installers", () => {
   assert.equal(BUNDLED_ADB.version, "37.0.1");
@@ -49,17 +60,9 @@ test("uses cargo-xwin for Windows x64 builds started on macOS", () => {
   assert.equal(plan.target, "x86_64-pc-windows-msvc");
   assert.equal(plan.runner, "cargo-xwin");
   assert.equal(plan.strategy, "cross-compile");
-  assert.equal(plan.producesInstaller, false);
-  assert.equal(plan.producesPortableArtifact, true);
+  assert.equal(plan.producesInstaller, true);
+  assert.equal(plan.producesPortableArtifact, false);
   assert.equal(plan.bundledAdbVersion, "37.0.1");
-});
-
-test("maps Windows ARM64 builds to the ARM64 MSVC target on macOS", () => {
-  const plan = createBuildPlan({ architecture: "arm64", hostPlatform: "darwin" });
-
-  assert.equal(plan.target, "aarch64-pc-windows-msvc");
-  assert.equal(plan.expectedMachine, 0xaa64);
-  assert.equal(plan.runner, "cargo-xwin");
 });
 
 test("keeps native Windows builds on the PowerShell packager", () => {
@@ -70,6 +73,40 @@ test("keeps native Windows builds on the PowerShell packager", () => {
   assert.equal(plan.producesInstaller, true);
   assert.equal(plan.producesPortableArtifact, false);
   assert.equal(plan.bundledAdbVersion, "37.0.1");
+});
+
+test("uses a single versioned x64 installer filename", () => {
+  assert.equal(
+    installerFileName("0.1.0"),
+    "OnmyojiSupportTools_0.1.0_windows_x64_nsis-setup.exe",
+  );
+});
+
+test("replaces dist contents with only the installer", () => {
+  const directory = mkdtempSync(join(tmpdir(), "onmyoji-dist-test-"));
+  try {
+    const source = join(directory, "generated-installer.exe");
+    const outputDirectory = join(directory, "dist");
+    const destination = join(outputDirectory, installerFileName("0.1.0"));
+    mkdirSync(outputDirectory);
+    writeFileSync(source, "installer");
+    writeFileSync(join(outputDirectory, "stale-portable.zip"), "stale");
+    writeFileSync(join(outputDirectory, "stale-installer.exe"), "stale");
+
+    replaceDistributionDirectory(source, destination, outputDirectory);
+
+    assert.deepEqual(readdirSync(outputDirectory), [installerFileName("0.1.0")]);
+    assert.equal(readFileSync(destination, "utf8"), "installer");
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("rejects the removed Windows ARM64 build target", () => {
+  assert.throws(
+    () => createBuildPlan({ architecture: "arm64", hostPlatform: "darwin" }),
+    /Unsupported Windows architecture/,
+  );
 });
 
 test("rejects unsupported architectures before spawning a build", () => {

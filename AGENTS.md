@@ -8,7 +8,7 @@
 
 ## Invariants
 
-- Windows x64 is the primary target. Windows ARM64 is an experimental build target; do not claim emulator compatibility without hardware validation.
+- Windows x64 is the only build and release target.
 - This is a Tauri desktop application. Do not add an HTTP server or browser deployment path.
 - Vue accesses devices only through the commands registered in `src-tauri/src/lib.rs`.
 - `DeviceManager` owns ADB discovery, process execution, timeouts, config, device state, frames, and tap validation.
@@ -21,4 +21,4 @@
 
 ## Completion checks
 
-Keep changes narrow and test observable behavior. Run `pnpm check` and `pnpm frontend:build`; run the affected `pnpm build:windows:x64` and/or `pnpm build:windows:arm64` target on Windows. Build artifact names must contain version, platform, and architecture. Update user documentation and `CHANGELOG.md` when behavior changes.
+Keep changes narrow and test observable behavior. Run `pnpm check` and `pnpm frontend:build`; run `pnpm build:windows:x64` on Windows. Build artifact names must contain version, platform, and architecture. Update user documentation and `CHANGELOG.md` when behavior changes.
