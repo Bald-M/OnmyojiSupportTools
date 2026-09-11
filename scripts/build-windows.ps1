@@ -31,8 +31,6 @@ $BundleDirectory = Join-Path $TargetRoot "bundle/nsis"
 $ArtifactDirectory = Join-Path $RepositoryRoot "artifacts/windows-$Architecture"
 $ArtifactStem = "OnmyojiSupportTools_${Version}_windows_${Architecture}"
 $InstallerPath = Join-Path $ArtifactDirectory "${ArtifactStem}_nsis-setup.exe"
-$PortableExecutablePath = Join-Path $ArtifactDirectory "${ArtifactStem}_portable.exe"
-$PortableZipPath = Join-Path $ArtifactDirectory "${ArtifactStem}_portable.zip"
 
 function Invoke-CheckedCommand {
     param(
@@ -101,21 +99,15 @@ try {
 
     New-Item -ItemType Directory -Force -Path $ArtifactDirectory | Out-Null
     Copy-Item -LiteralPath $GeneratedInstallerPath -Destination $InstallerPath -Force
-    Copy-Item -LiteralPath $BinaryPath -Destination $PortableExecutablePath -Force
-    Compress-Archive -Path $PortableExecutablePath -DestinationPath $PortableZipPath -Force
-    Remove-Item -LiteralPath $PortableExecutablePath
 
     if ($env:GITHUB_OUTPUT) {
         "target=$Target" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
         "installer_path=artifacts/windows-$Architecture/${ArtifactStem}_nsis-setup.exe" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-        "portable_zip_path=artifacts/windows-$Architecture/${ArtifactStem}_portable.zip" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
     }
 
     Write-Host "Verified platform=windows architecture=$Architecture target=$Target"
     Write-Host "NSIS: $InstallerPath"
-    Write-Host "Portable ZIP: $PortableZipPath"
 }
 finally {
     Pop-Location

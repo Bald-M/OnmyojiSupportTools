@@ -1,4 +1,4 @@
-export type AdbSource = 'saved' | 'muMu12' | 'ldPlayer9' | 'path' | 'manual'
+export type AdbSource = 'bundled' | 'saved' | 'muMu12' | 'ldPlayer9' | 'path' | 'manual'
 export type DeviceStatus = 'online' | 'offline' | 'unauthorized' | 'unknown'
 
 export interface AdbCandidate {

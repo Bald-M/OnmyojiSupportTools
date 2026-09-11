@@ -107,10 +107,3 @@ jobs:
           name: OnmyojiSupportTools-0.1.0-${{ matrix.platform }}-${{ matrix.arch }}-nsis
           path: ${{ steps.package.outputs.installer_path }}
           if-no-files-found: error
-
-      - name: Upload portable ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: OnmyojiSupportTools-0.1.0-${{ matrix.platform }}-${{ matrix.arch }}-portable
-          path: ${{ steps.package.outputs.portable_zip_path }}
-          if-no-files-found: error

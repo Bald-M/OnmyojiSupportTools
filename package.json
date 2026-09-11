@@ -6,17 +6,18 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "pnpm prepare:adb && tauri dev",
     "frontend:dev": "vite",
     "frontend:build": "vue-tsc --noEmit && vite build",
     "build": "pnpm build:windows:x64",
     "build:windows": "pnpm build:windows:x64",
     "build:windows:x64": "node scripts/build-windows.mjs --architecture x64",
     "build:windows:arm64": "node scripts/build-windows.mjs --architecture arm64",
+    "prepare:adb": "node scripts/prepare-bundled-adb.mjs",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "vue-tsc --noEmit",
     "test": "node --test scripts/build-windows.node-test.mjs && vitest run",
-    "check": "pnpm lint && pnpm typecheck && pnpm test && cargo fmt --check --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml",
+    "check": "pnpm prepare:adb && pnpm lint && pnpm typecheck && pnpm test && cargo fmt --check --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings && cargo test --manifest-path src-tauri/Cargo.toml",
     "tauri": "tauri"
   },
   "dependencies": {

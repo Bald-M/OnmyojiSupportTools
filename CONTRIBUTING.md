@@ -30,6 +30,7 @@ docs: explain portable WebView2 requirement
 - ADB 操作必须有超时，并保留单活动设备、截图归属和坐标边界校验。
 - 截图使用原始二进制传输，不增加 Base64 或重复编码。
 - 新行为需要测试；优先通过假的命令执行适配器测试，不依赖真实设备。
+- 内置 ADB 的版本、来源和哈希以 `src-tauri/adb-distribution.json` 为唯一机器可读清单，只能由 `scripts/prepare-bundled-adb.mjs` 准备；应用运行时不得下载 ADB，升级时必须同步来源记录和 NOTICE。
 
 ## 提交前检查
 
@@ -41,7 +42,7 @@ pnpm build:windows:x64
 pnpm build:windows:arm64
 ```
 
-Windows 上的两个桌面构建使用原生 MSVC，ARM64 还需要 Visual Studio C++ ARM64 build tools。macOS 可先执行 `brew install llvm` 和 `cargo install --locked cargo-xwin`，再通过相同命令交叉编译便携 ZIP；NSIS 安装包仍由原生 Windows 或 CI 构建。若未执行某个架构，请在 PR 中说明，CI 会在对应原生 Windows runner 上复核。
+Windows 上的两个桌面构建使用原生 MSVC，ARM64 还需要 Visual Studio C++ ARM64 build tools，并生成面向用户的 NSIS 安装包。macOS 可先执行 `brew install llvm` 和 `cargo install --locked cargo-xwin`，再通过相同命令交叉编译仅用于开发验证的便携 ZIP；可卸载安装包仍由原生 Windows 或 CI 构建。若未执行某个架构，请在 PR 中说明，CI 会在对应原生 Windows runner 上复核。
 
 涉及设备流程时，按影响范围执行 [Windows 验收矩阵](docs/windows-acceptance.md)：自动/手动 ADB、单/多设备、IP 连接、截图、缩放取点、点击，以及离线、未授权和超时恢复。
 

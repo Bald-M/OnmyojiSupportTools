@@ -2,14 +2,18 @@ import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
+  cpSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
 } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+
+import { BUNDLED_ADB } from "./prepare-bundled-adb.mjs";
 
 const ARCHITECTURES = Object.freeze({
   x64: Object.freeze({
@@ -36,8 +40,10 @@ export function createBuildPlan({ architecture, hostPlatform = process.platform 
     return {
       architecture,
       ...targetConfig,
+      bundledAdbVersion: BUNDLED_ADB.version,
       hostPlatform,
       producesInstaller: true,
+      producesPortableArtifact: false,
       runner: null,
       strategy: "native",
     };
@@ -47,8 +53,10 @@ export function createBuildPlan({ architecture, hostPlatform = process.platform 
     return {
       architecture,
       ...targetConfig,
+      bundledAdbVersion: BUNDLED_ADB.version,
       hostPlatform,
       producesInstaller: false,
+      producesPortableArtifact: true,
       runner: "cargo-xwin",
       strategy: "cross-compile",
     };
@@ -84,7 +92,7 @@ function parseArguments(arguments_) {
 
 function runChecked(program, arguments_, options = {}) {
   const result = spawnSync(program, arguments_, {
-    cwd: repositoryRoot,
+    cwd: options.cwd ?? repositoryRoot,
     env: options.env ?? process.env,
     stdio: "inherit",
   });
@@ -181,7 +189,6 @@ function packageMacPortableArtifact(plan, version, env) {
     `windows-${plan.architecture}`,
   );
   const artifactStem = `OnmyojiSupportTools_${version}_windows_${plan.architecture}`;
-  const portableExecutablePath = join(artifactDirectory, `${artifactStem}_portable.exe`);
   const portableZipPath = join(artifactDirectory, `${artifactStem}_portable.zip`);
 
   if (!existsSync(binaryPath)) {
@@ -190,21 +197,28 @@ function packageMacPortableArtifact(plan, version, env) {
   assertPeArchitecture(binaryPath, plan.expectedMachine);
 
   mkdirSync(artifactDirectory, { recursive: true });
-  copyFileSync(binaryPath, portableExecutablePath);
+  const stagingDirectory = mkdtempSync(join(artifactDirectory, ".portable-"));
   rmSync(portableZipPath, { force: true });
   try {
-    runChecked("/usr/bin/zip", ["-j", "-q", portableZipPath, portableExecutablePath], {
+    copyFileSync(binaryPath, join(stagingDirectory, "OnmyojiSupportTools.exe"));
+    cpSync(
+      join(repositoryRoot, "src-tauri", "generated", "adb"),
+      join(stagingDirectory, "adb"),
+      { recursive: true },
+    );
+    runChecked("/usr/bin/zip", ["-r", "-q", portableZipPath, "."], {
+      cwd: stagingDirectory,
       env,
     });
   } finally {
-    rmSync(portableExecutablePath, { force: true });
+    rmSync(stagingDirectory, { recursive: true, force: true });
   }
 
   process.stdout.write(
     `Verified platform=windows architecture=${plan.architecture} target=${plan.target}\n`,
   );
   process.stdout.write("NSIS: skipped on macOS; use a native Windows build or CI\n");
-  process.stdout.write(`Portable ZIP: ${portableZipPath}\n`);
+  process.stdout.write(`Diagnostic portable ZIP: ${portableZipPath}\n`);
 }
 
 function buildOnMac(plan) {
@@ -254,6 +268,8 @@ function main() {
     process.stdout.write(`${JSON.stringify(plan)}\n`);
     return;
   }
+
+  runChecked(process.execPath, [join(repositoryRoot, "scripts", "prepare-bundled-adb.mjs")]);
 
   if (plan.strategy === "native") {
     buildOnWindows(plan);

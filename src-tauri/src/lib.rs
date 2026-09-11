@@ -54,11 +54,16 @@ async fn tap_screen(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let config_path = app.path().app_config_dir()?.join("config.json");
-            app.manage(DeviceManager::new(config_path));
+            let bundled_adb_path = if cfg!(target_os = "windows") {
+                Some(app.path().resource_dir()?.join("adb").join("adb.exe"))
+            } else {
+                None
+            };
+            app.manage(DeviceManager::new(config_path, bundled_adb_path));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -70,6 +75,17 @@ pub fn run() {
             capture_screen,
             tap_screen
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run OnmyojiSupportTools");
+        .build(tauri::generate_context!())
+        .expect("failed to build OnmyojiSupportTools");
+
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event
+            && let Err(error) = tauri::async_runtime::block_on(async {
+                let manager = app_handle.state::<DeviceManager>();
+                manager.shutdown().await
+            })
+        {
+            eprintln!("failed to stop the bundled ADB server: {error}");
+        }
+    });
 }

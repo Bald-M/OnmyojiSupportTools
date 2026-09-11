@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env, fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, TcpListener},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -10,9 +10,19 @@ use std::{
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::{process::Command, sync::RwLock, time::timeout};
+use sha2::{Digest, Sha256};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    process::Command,
+    sync::{Mutex, RwLock},
+    time::timeout,
+};
 
 const ADB_TIMEOUT: Duration = Duration::from_secs(8);
+const BUNDLED_ADB_SERVER_PORT: u16 = 5038;
+const BUNDLED_ADB_DISTRIBUTION_JSON: &str = include_str!("../adb-distribution.json");
+const MAX_ADB_SERVER_STATUS_BYTES: usize = 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
 #[derive(Debug, Clone, Serialize)]
@@ -27,6 +37,7 @@ pub struct AdbCandidate {
 #[serde(rename_all = "camelCase")]
 pub enum AdbSource {
     Saved,
+    Bundled,
     #[cfg(target_os = "windows")]
     MuMu12,
     #[cfg(target_os = "windows")]
@@ -184,12 +195,62 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdbServerIdentity {
+    version: String,
+    executable_absolute_path: PathBuf,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct AdbServerStatusProto {
+    #[prost(string, tag = "5")]
+    version: String,
+    #[prost(string, tag = "6")]
+    build: String,
+    #[prost(string, tag = "7")]
+    executable_absolute_path: String,
+}
+
+#[async_trait]
+trait AdbServerProbe: Send + Sync {
+    async fn identity(&self, port: u16, limit: Duration) -> Result<AdbServerIdentity, AppError>;
+}
+
+struct SmartSocketAdbServerProbe;
+
+#[async_trait]
+impl AdbServerProbe for SmartSocketAdbServerProbe {
+    async fn identity(&self, port: u16, limit: Duration) -> Result<AdbServerIdentity, AppError> {
+        query_adb_server_identity(port, limit).await
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredConfig {
     adb_path: Option<PathBuf>,
     active_device_serial: Option<String>,
     last_endpoint: Option<ConnectEndpoint>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BundledAdbDistribution {
+    version: String,
+    files: Vec<BundledAdbFile>,
+}
+
+#[derive(Deserialize)]
+struct BundledAdbFile {
+    name: String,
+    sha256: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BundledAdbIntegrity {
+    Verify,
+    #[cfg(test)]
+    Skip,
 }
 
 #[derive(Default)]
@@ -206,18 +267,89 @@ struct RuntimeState {
 pub struct DeviceManager {
     runner: Arc<dyn CommandRunner>,
     config_path: PathBuf,
+    bundled_adb_path: Option<PathBuf>,
+    bundled_adb_integrity: BundledAdbIntegrity,
+    bundled_server_port: u16,
+    bundled_server_owned: Mutex<bool>,
+    server_probe: Arc<dyn AdbServerProbe>,
     state: RwLock<RuntimeState>,
 }
 
 impl DeviceManager {
-    pub fn new(config_path: PathBuf) -> Self {
-        Self::with_runner(config_path, Arc::new(ProcessRunner))
+    pub fn new(config_path: PathBuf, bundled_adb_path: Option<PathBuf>) -> Self {
+        Self::with_runner_and_optional_bundled_adb(
+            config_path,
+            bundled_adb_path,
+            BundledAdbIntegrity::Verify,
+            BUNDLED_ADB_SERVER_PORT,
+            Arc::new(ProcessRunner),
+            Arc::new(SmartSocketAdbServerProbe),
+        )
     }
 
+    #[cfg(test)]
     fn with_runner(config_path: PathBuf, runner: Arc<dyn CommandRunner>) -> Self {
+        Self::with_runner_and_optional_bundled_adb(
+            config_path,
+            None,
+            BundledAdbIntegrity::Skip,
+            BUNDLED_ADB_SERVER_PORT,
+            runner,
+            Arc::new(SmartSocketAdbServerProbe),
+        )
+    }
+
+    #[cfg(test)]
+    fn with_runner_and_bundled_adb(
+        config_path: PathBuf,
+        bundled_adb_path: PathBuf,
+        runner: Arc<dyn CommandRunner>,
+        server_probe: Arc<dyn AdbServerProbe>,
+    ) -> Self {
+        Self::with_runner_and_optional_bundled_adb(
+            config_path,
+            Some(bundled_adb_path),
+            BundledAdbIntegrity::Skip,
+            BUNDLED_ADB_SERVER_PORT,
+            runner,
+            server_probe,
+        )
+    }
+
+    #[cfg(test)]
+    fn with_runner_and_bundled_adb_on_port(
+        config_path: PathBuf,
+        bundled_adb_path: PathBuf,
+        bundled_server_port: u16,
+        runner: Arc<dyn CommandRunner>,
+        server_probe: Arc<dyn AdbServerProbe>,
+    ) -> Self {
+        Self::with_runner_and_optional_bundled_adb(
+            config_path,
+            Some(bundled_adb_path),
+            BundledAdbIntegrity::Skip,
+            bundled_server_port,
+            runner,
+            server_probe,
+        )
+    }
+
+    fn with_runner_and_optional_bundled_adb(
+        config_path: PathBuf,
+        bundled_adb_path: Option<PathBuf>,
+        bundled_adb_integrity: BundledAdbIntegrity,
+        bundled_server_port: u16,
+        runner: Arc<dyn CommandRunner>,
+        server_probe: Arc<dyn AdbServerProbe>,
+    ) -> Self {
         Self {
             runner,
             config_path,
+            bundled_adb_path,
+            bundled_adb_integrity,
+            bundled_server_port,
+            bundled_server_owned: Mutex::new(false),
+            server_probe,
             state: RwLock::new(RuntimeState::default()),
         }
     }
@@ -229,9 +361,20 @@ impl DeviceManager {
 
         let config = self.load_config()?;
         let mut candidates = Vec::new();
-        for (path, source) in discover_adb_paths(config.adb_path.as_deref()) {
-            if let Ok(candidate) = self.validate_adb(&path, source).await {
-                candidates.push(candidate);
+        let mut bundled_adb_error = None;
+        for (path, source) in
+            discover_adb_paths(config.adb_path.as_deref(), self.bundled_adb_path.as_deref())
+        {
+            match self.validate_adb(&path, source).await {
+                Ok(candidate) => candidates.push(candidate),
+                Err(error) if source == AdbSource::Bundled => {
+                    bundled_adb_error = Some(AppError::new(
+                        "BUNDLED_ADB_INVALID",
+                        format!("应用内置 ADB 无法使用：{}", error.message),
+                        "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+                    ));
+                }
+                Err(_) => {}
             }
         }
 
@@ -247,6 +390,8 @@ impl DeviceManager {
 
         if self.state.read().await.selected_adb.is_some() {
             self.refresh_devices().await
+        } else if let Some(error) = bundled_adb_error {
+            Err(error)
         } else {
             Ok(self.snapshot().await)
         }
@@ -284,10 +429,9 @@ impl DeviceManager {
 
     pub async fn refresh_devices(&self) -> Result<AppState, AppError> {
         let adb = self.selected_adb_path().await?;
-        let output = self
-            .runner
-            .run(&adb, &strings(&["devices", "-l"]), ADB_TIMEOUT)
-            .await?;
+        self.ensure_bundled_server(&adb).await?;
+        let args = self.adb_args(&adb, &["devices", "-l"]);
+        let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
         ensure_success(
             output.success,
             &output.stdout,
@@ -324,10 +468,9 @@ impl DeviceManager {
     pub async fn connect_device(&self, endpoint: ConnectEndpoint) -> Result<AppState, AppError> {
         let target = parse_endpoint(&endpoint)?;
         let adb = self.selected_adb_path().await?;
-        let output = self
-            .runner
-            .run(&adb, &strings(&["connect", &target]), ADB_TIMEOUT)
-            .await?;
+        self.ensure_bundled_server(&adb).await?;
+        let args = self.adb_args(&adb, &["connect", &target]);
+        let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
         ensure_success(
             output.success,
             &output.stdout,
@@ -371,14 +514,9 @@ impl DeviceManager {
 
     pub async fn capture_screen(&self) -> Result<Vec<u8>, AppError> {
         let (adb, serial) = self.active_command_context().await?;
-        let output = self
-            .runner
-            .run(
-                &adb,
-                &strings(&["-s", &serial, "exec-out", "screencap", "-p"]),
-                ADB_TIMEOUT,
-            )
-            .await?;
+        self.ensure_bundled_server(&adb).await?;
+        let args = self.adb_args(&adb, &["-s", &serial, "exec-out", "screencap", "-p"]);
+        let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
         ensure_success(
             output.success,
             &output.stdout,
@@ -437,14 +575,9 @@ impl DeviceManager {
 
         let x = point.x.to_string();
         let y = point.y.to_string();
-        let output = self
-            .runner
-            .run(
-                &adb,
-                &strings(&["-s", &serial, "shell", "input", "tap", &x, &y]),
-                ADB_TIMEOUT,
-            )
-            .await?;
+        self.ensure_bundled_server(&adb).await?;
+        let args = self.adb_args(&adb, &["-s", &serial, "shell", "input", "tap", &x, &y]);
+        let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
         ensure_success(
             output.success,
             &output.stdout,
@@ -461,7 +594,44 @@ impl DeviceManager {
         })
     }
 
+    pub async fn shutdown(&self) -> Result<(), AppError> {
+        let mut owned = self.bundled_server_owned.lock().await;
+        if !*owned {
+            return Ok(());
+        }
+        let Some(adb) = self.bundled_adb_path.as_deref() else {
+            return Ok(());
+        };
+        if let Err(error) = self.verify_bundled_server_identity(adb).await {
+            *owned = false;
+            return Err(error);
+        }
+
+        let args = self.adb_args(adb, &["kill-server"]);
+        let output = self.runner.run(adb, &args, ADB_TIMEOUT).await?;
+        ensure_success(
+            output.success,
+            &output.stdout,
+            &output.stderr,
+            "ADB_SHUTDOWN_FAILED",
+            "无法停止应用内置的 ADB 服务",
+            "请关闭残留的 adb.exe 后再卸载或升级",
+        )?;
+        *owned = false;
+        Ok(())
+    }
+
     async fn validate_adb(&self, path: &Path, source: AdbSource) -> Result<AdbCandidate, AppError> {
+        let bundled_distribution = if source == AdbSource::Bundled {
+            let distribution = parse_bundled_adb_distribution()?;
+            if self.bundled_adb_integrity == BundledAdbIntegrity::Verify {
+                validate_bundled_adb_files(path, &distribution)?;
+            }
+            Some(distribution)
+        } else {
+            None
+        };
+
         if !path.is_file() {
             return Err(AppError::new(
                 "ADB_INVALID",
@@ -470,10 +640,8 @@ impl DeviceManager {
             ));
         }
 
-        let output = self
-            .runner
-            .run(path, &strings(&["version"]), ADB_TIMEOUT)
-            .await?;
+        let args = self.adb_args(path, &["version"]);
+        let output = self.runner.run(path, &args, ADB_TIMEOUT).await?;
         ensure_success(
             output.success,
             &output.stdout,
@@ -490,12 +658,113 @@ impl DeviceManager {
                 "请选择 Android Debug Bridge 可执行文件",
             )
         })?;
+        if let Some(distribution) = bundled_distribution
+            && version.split('-').next() != Some(distribution.version.as_str())
+        {
+            return Err(AppError::new(
+                "ADB_INVALID",
+                format!(
+                    "应用内置 ADB 版本应为 {}，实际为 {version}",
+                    distribution.version
+                ),
+                "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+            ));
+        }
 
         Ok(AdbCandidate {
             path: path.to_string_lossy().into_owned(),
             source,
             version,
         })
+    }
+
+    fn adb_args(&self, path: &Path, args: &[&str]) -> Vec<String> {
+        let mut values = Vec::with_capacity(args.len() + 2);
+        if self.is_bundled_adb(path) {
+            values.push("-P".to_owned());
+            values.push(self.bundled_server_port.to_string());
+        }
+        values.extend(strings(args));
+        values
+    }
+
+    fn is_bundled_adb(&self, path: &Path) -> bool {
+        self.bundled_adb_path
+            .as_deref()
+            .is_some_and(|bundled| same_path(bundled, path))
+    }
+
+    async fn ensure_bundled_server(&self, path: &Path) -> Result<(), AppError> {
+        if !self.is_bundled_adb(path) {
+            return Ok(());
+        }
+
+        let mut owned = self.bundled_server_owned.lock().await;
+        if *owned {
+            return Ok(());
+        }
+
+        if let Err(port_error) = ensure_bundled_server_port_available(self.bundled_server_port) {
+            if self.verify_bundled_server_identity(path).await.is_ok() {
+                *owned = true;
+                return Ok(());
+            }
+            return Err(port_error);
+        }
+
+        let args = self.adb_args(path, &["start-server"]);
+        let output = self.runner.run(path, &args, ADB_TIMEOUT).await?;
+        ensure_success(
+            output.success,
+            &output.stdout,
+            &output.stderr,
+            "BUNDLED_ADB_START_FAILED",
+            "无法启动应用内置的 ADB 服务",
+            "请重试，或选择一个外部 adb.exe",
+        )?;
+        self.verify_bundled_server_identity(path).await?;
+        *owned = true;
+        Ok(())
+    }
+
+    async fn verify_bundled_server_identity(&self, adb: &Path) -> Result<(), AppError> {
+        let recovery = format!(
+            "请关闭占用端口 {} 的程序后重试，或选择一个外部 adb.exe",
+            self.bundled_server_port
+        );
+        let identity = self
+            .server_probe
+            .identity(self.bundled_server_port, ADB_TIMEOUT)
+            .await
+            .map_err(|error| {
+                AppError::new(
+                    "BUNDLED_ADB_SERVER_UNVERIFIED",
+                    format!("无法确认应用内置 ADB 服务的身份：{}", error.message),
+                    &recovery,
+                )
+            })?;
+        let expected_version = parse_bundled_adb_distribution()?.version;
+        if identity.version != expected_version {
+            return Err(AppError::new(
+                "BUNDLED_ADB_SERVER_UNVERIFIED",
+                format!(
+                    "端口 {} 上的 ADB 服务版本应为 {expected_version}，实际为 {}",
+                    self.bundled_server_port, identity.version
+                ),
+                &recovery,
+            ));
+        }
+        if !same_path(&identity.executable_absolute_path, adb) {
+            return Err(AppError::new(
+                "BUNDLED_ADB_SERVER_UNVERIFIED",
+                format!(
+                    "端口 {} 上的 ADB 服务不属于本应用",
+                    self.bundled_server_port
+                ),
+                &recovery,
+            ));
+        }
+        Ok(())
     }
 
     async fn selected_adb_path(&self) -> Result<PathBuf, AppError> {
@@ -550,6 +819,107 @@ impl DeviceManager {
     }
 }
 
+async fn query_adb_server_identity(
+    port: u16,
+    limit: Duration,
+) -> Result<AdbServerIdentity, AppError> {
+    timeout(limit, query_adb_server_identity_inner(port))
+        .await
+        .map_err(|_| {
+            AppError::new(
+                "BUNDLED_ADB_SERVER_UNVERIFIED",
+                format!("读取端口 {port} 上的 ADB 服务状态超时"),
+                "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+            )
+        })?
+}
+
+async fn query_adb_server_identity_inner(port: u16) -> Result<AdbServerIdentity, AppError> {
+    use prost::Message;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+    let service = b"host:server-status";
+    let request = format!("{:04x}", service.len());
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+    stream
+        .write_all(service)
+        .await
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+
+    let mut status = [0_u8; 4];
+    stream
+        .read_exact(&mut status)
+        .await
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+    if &status != b"OKAY" && &status != b"FAIL" {
+        return Err(AppError::new(
+            "BUNDLED_ADB_SERVER_UNVERIFIED",
+            format!("端口 {port} 返回了无效的 ADB 协议状态"),
+            "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+        ));
+    }
+    let payload_length = read_adb_protocol_length(&mut stream, port).await?;
+    if payload_length > MAX_ADB_SERVER_STATUS_BYTES {
+        return Err(AppError::new(
+            "BUNDLED_ADB_SERVER_UNVERIFIED",
+            format!("端口 {port} 返回的 ADB 服务状态数据过大"),
+            "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+        ));
+    }
+    let mut payload = vec![0_u8; payload_length];
+    stream
+        .read_exact(&mut payload)
+        .await
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+    if &status == b"FAIL" {
+        return Err(AppError::new(
+            "BUNDLED_ADB_SERVER_UNVERIFIED",
+            format!(
+                "端口 {port} 拒绝返回 ADB 服务状态：{}",
+                String::from_utf8_lossy(&payload).trim()
+            ),
+            "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+        ));
+    }
+    let server_status = AdbServerStatusProto::decode(payload.as_slice())
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+    if server_status.version.is_empty() || server_status.executable_absolute_path.is_empty() {
+        return Err(AppError::new(
+            "BUNDLED_ADB_SERVER_UNVERIFIED",
+            format!("端口 {port} 返回的 ADB 服务身份不完整"),
+            "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+        ));
+    }
+    Ok(AdbServerIdentity {
+        version: server_status.version,
+        executable_absolute_path: PathBuf::from(server_status.executable_absolute_path),
+    })
+}
+
+async fn read_adb_protocol_length(stream: &mut TcpStream, port: u16) -> Result<usize, AppError> {
+    let mut encoded = [0_u8; 4];
+    stream
+        .read_exact(&mut encoded)
+        .await
+        .map_err(|error| adb_server_protocol_error(port, error))?;
+    let encoded =
+        std::str::from_utf8(&encoded).map_err(|error| adb_server_protocol_error(port, error))?;
+    usize::from_str_radix(encoded, 16).map_err(|error| adb_server_protocol_error(port, error))
+}
+
+fn adb_server_protocol_error(port: u16, error: impl std::fmt::Display) -> AppError {
+    AppError::new(
+        "BUNDLED_ADB_SERVER_UNVERIFIED",
+        format!("无法读取端口 {port} 上的 ADB 服务状态：{error}"),
+        "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+    )
+}
+
 fn selected_path(state: &RuntimeState) -> Result<PathBuf, AppError> {
     state
         .selected_adb
@@ -589,7 +959,7 @@ fn ensure_success(
     stderr: &[u8],
     code: &'static str,
     message: &'static str,
-    recovery: &'static str,
+    recovery: &str,
 ) -> Result<(), AppError> {
     if success {
         return Ok(());
@@ -721,6 +1091,62 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
+fn ensure_bundled_server_port_available(port: u16) -> Result<(), AppError> {
+    TcpListener::bind(("127.0.0.1", port))
+        .map(drop)
+        .map_err(|error| {
+            AppError::new(
+                "BUNDLED_ADB_PORT_UNAVAILABLE",
+                format!("应用内置 ADB 的专用端口 {port} 不可用：{error}"),
+                "请关闭占用该端口的程序后重试，或选择一个外部 adb.exe",
+            )
+        })
+}
+
+fn parse_bundled_adb_distribution() -> Result<BundledAdbDistribution, AppError> {
+    serde_json::from_str(BUNDLED_ADB_DISTRIBUTION_JSON).map_err(|error| {
+        AppError::new(
+            "ADB_INVALID",
+            format!("无法读取内置 ADB 的分发清单：{error}"),
+            "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+        )
+    })
+}
+
+fn validate_bundled_adb_files(
+    adb_path: &Path,
+    distribution: &BundledAdbDistribution,
+) -> Result<(), AppError> {
+    let directory = adb_path.parent().ok_or_else(|| {
+        AppError::new(
+            "ADB_INVALID",
+            "内置 ADB 路径缺少安装目录",
+            "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+        )
+    })?;
+
+    for file in &distribution.files {
+        let path = directory.join(&file.name);
+        let bytes = fs::read(&path).map_err(|error| {
+            AppError::new(
+                "ADB_INVALID",
+                format!("无法读取内置 ADB 文件 {}：{error}", file.name),
+                "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+            )
+        })?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(bytes));
+        if actual_sha256 != file.sha256 {
+            return Err(AppError::new(
+                "ADB_INVALID",
+                format!("内置 ADB 文件 {} 校验失败", file.name),
+                "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn find_candidate(candidates: &[AdbCandidate], path: &Path) -> Option<AdbCandidate> {
     candidates
         .iter()
@@ -731,6 +1157,12 @@ fn find_candidate(candidates: &[AdbCandidate], path: &Path) -> Option<AdbCandida
 fn select_initial_adb(candidates: &[AdbCandidate], saved: Option<&Path>) -> Option<AdbCandidate> {
     saved
         .and_then(|path| find_candidate(candidates, path))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|candidate| candidate.source == AdbSource::Bundled)
+                .cloned()
+        })
         .or_else(|| (candidates.len() == 1).then(|| candidates[0].clone()))
 }
 
@@ -741,8 +1173,14 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn discover_adb_paths(saved: Option<&Path>) -> Vec<(PathBuf, AdbSource)> {
+fn discover_adb_paths(
+    saved: Option<&Path>,
+    bundled_adb_path: Option<&Path>,
+) -> Vec<(PathBuf, AdbSource)> {
     let mut candidates = Vec::new();
+    if let Some(path) = bundled_adb_path {
+        candidates.push((path.to_path_buf(), AdbSource::Bundled));
+    }
     if let Some(path) = saved {
         candidates.push((path.to_path_buf(), AdbSource::Saved));
     }
@@ -753,7 +1191,8 @@ fn discover_adb_paths(saved: Option<&Path>) -> Vec<(PathBuf, AdbSource)> {
 
     let mut seen = HashSet::new();
     candidates.retain(|(path, _)| {
-        path.is_file() && seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone()))
+        seen.insert(path.canonicalize().unwrap_or_else(|_| path.clone()))
+            && (path.is_file() || bundled_adb_path.is_some_and(|bundled| same_path(bundled, path)))
     });
     candidates
 }
@@ -818,15 +1257,23 @@ fn epoch_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, path::Path, sync::Arc, time::Duration};
+    use std::{
+        collections::VecDeque,
+        net::TcpListener,
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use tokio::sync::Mutex;
 
     use super::{
-        AdbCandidate, AdbSource, AppError, CommandOutput, CommandRunner, ConnectEndpoint,
-        DeviceManager, Point, ensure_success, parse_devices, parse_endpoint, select_initial_adb,
-        strings, validate_png,
+        AdbCandidate, AdbServerIdentity, AdbServerProbe, AdbServerStatusProto, AdbSource, AppError,
+        BundledAdbDistribution, BundledAdbFile, CommandOutput, CommandRunner, ConnectEndpoint,
+        DeviceManager, Point, ensure_bundled_server_port_available, ensure_success, parse_devices,
+        parse_endpoint, query_adb_server_identity, select_initial_adb, strings,
+        validate_bundled_adb_files, validate_png,
     };
 
     struct FakeRunner {
@@ -848,6 +1295,44 @@ mod tests {
 
         async fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().await.clone()
+        }
+    }
+
+    struct FakeServerProbe {
+        identities: Mutex<VecDeque<Result<AdbServerIdentity, AppError>>>,
+        ports: Mutex<Vec<u16>>,
+    }
+
+    impl FakeServerProbe {
+        fn with_identities(identities: Vec<AdbServerIdentity>) -> Self {
+            Self {
+                identities: Mutex::new(identities.into_iter().map(Ok).collect()),
+                ports: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn empty() -> Self {
+            Self::with_identities(Vec::new())
+        }
+
+        async fn ports(&self) -> Vec<u16> {
+            self.ports.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl AdbServerProbe for FakeServerProbe {
+        async fn identity(
+            &self,
+            port: u16,
+            _limit: Duration,
+        ) -> Result<AdbServerIdentity, AppError> {
+            self.ports.lock().await.push(port);
+            self.identities
+                .lock()
+                .await
+                .pop_front()
+                .expect("queued server identity")
         }
     }
 
@@ -882,6 +1367,54 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         }
+    }
+
+    fn bundled_server_identity(adb_path: &Path) -> AdbServerIdentity {
+        AdbServerIdentity {
+            version: "37.0.1".to_owned(),
+            executable_absolute_path: adb_path.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_server_identity_directly_from_the_adb_smart_socket() {
+        use prost::Message;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let expected_path = PathBuf::from(r"C:\Program Files\OnmyojiSupportTools\adb\adb.exe");
+        let payload = AdbServerStatusProto {
+            version: "37.0.1".to_owned(),
+            build: "14129643".to_owned(),
+            executable_absolute_path: expected_path.to_string_lossy().into_owned(),
+        }
+        .encode_to_vec();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).await.unwrap();
+            let length = usize::from_str_radix(std::str::from_utf8(&length).unwrap(), 16).unwrap();
+            let mut request = vec![0_u8; length];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, b"host:server-status");
+            stream.write_all(b"OKAY").await.unwrap();
+            stream
+                .write_all(format!("{:04x}", payload.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&payload).await.unwrap();
+        });
+
+        let identity = query_adb_server_identity(port, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert_eq!(identity.version, "37.0.1");
+        assert_eq!(identity.executable_absolute_path, expected_path);
+        server.await.unwrap();
     }
 
     #[test]
@@ -948,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_a_saved_or_only_adb_candidate_but_not_an_ambiguous_one() {
+    fn selects_a_saved_then_bundled_then_only_adb_candidate() {
         let first = AdbCandidate {
             path: "first-adb.exe".to_owned(),
             source: AdbSource::Manual,
@@ -959,6 +1492,11 @@ mod tests {
             source: AdbSource::Path,
             version: "35.0.2".to_owned(),
         };
+        let bundled = AdbCandidate {
+            path: "bundled-adb.exe".to_owned(),
+            source: AdbSource::Bundled,
+            version: "37.0.1".to_owned(),
+        };
 
         assert_eq!(
             select_initial_adb(std::slice::from_ref(&first), None)
@@ -968,11 +1506,50 @@ mod tests {
         );
         assert!(select_initial_adb(&[first.clone(), second.clone()], None).is_none());
         assert_eq!(
-            select_initial_adb(&[first, second.clone()], Some(Path::new("second-adb.exe")),)
+            select_initial_adb(&[first.clone(), bundled.clone(), second.clone()], None)
                 .unwrap()
                 .path,
+            bundled.path
+        );
+        assert_eq!(
+            select_initial_adb(
+                &[first, bundled, second.clone()],
+                Some(Path::new("second-adb.exe")),
+            )
+            .unwrap()
+            .path,
             second.path
         );
+    }
+
+    #[test]
+    fn refuses_to_claim_a_bundled_adb_port_that_another_process_owns() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let error = ensure_bundled_server_port_available(port).unwrap_err();
+
+        assert_eq!(error.code, "BUNDLED_ADB_PORT_UNAVAILABLE");
+    }
+
+    #[test]
+    fn rejects_a_tampered_bundled_adb_file_at_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, b"tampered").unwrap();
+        let distribution = BundledAdbDistribution {
+            version: "37.0.1".to_owned(),
+            files: vec![BundledAdbFile {
+                name: "adb.exe".to_owned(),
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_owned(),
+            }],
+        };
+
+        let error = validate_bundled_adb_files(&adb_path, &distribution).unwrap_err();
+
+        assert_eq!(error.code, "ADB_INVALID");
+        assert!(error.message.contains("校验失败"));
     }
 
     #[tokio::test]
@@ -989,6 +1566,199 @@ mod tests {
 
         assert_eq!(error.code, "ADB_INVALID");
         assert!(runner.calls().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reports_a_missing_bundled_adb_as_a_recoverable_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(Vec::new()));
+        let manager = DeviceManager::with_runner_and_bundled_adb(
+            directory.path().join("config.json"),
+            directory.path().join("missing-adb.exe"),
+            runner.clone(),
+            Arc::new(FakeServerProbe::empty()),
+        );
+
+        let error = manager.initialize().await.unwrap_err();
+
+        assert_eq!(error.code, "BUNDLED_ADB_INVALID");
+        assert!(error.recovery.as_deref().unwrap().contains("外部 adb.exe"));
+        assert!(runner.calls().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_bundled_adb_with_an_unexpected_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2-12147458"),
+            success(""),
+            success("List of devices attached\n"),
+        ]));
+        let manager = DeviceManager::with_runner_and_bundled_adb(
+            directory.path().join("config.json"),
+            adb_path,
+            runner,
+            Arc::new(FakeServerProbe::empty()),
+        );
+
+        let error = manager.initialize().await.unwrap_err();
+
+        assert_eq!(error.code, "BUNDLED_ADB_INVALID");
+        assert!(error.message.contains("37.0.1"));
+    }
+
+    #[tokio::test]
+    async fn initializes_with_the_bundled_adb_when_no_selection_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643"),
+            success(""),
+            success("List of devices attached\n"),
+            success(""),
+        ]));
+        let server_probe = Arc::new(FakeServerProbe::with_identities(vec![
+            bundled_server_identity(&adb_path),
+            bundled_server_identity(&adb_path),
+        ]));
+        let manager = DeviceManager::with_runner_and_bundled_adb(
+            directory.path().join("config.json"),
+            adb_path.clone(),
+            runner.clone(),
+            server_probe.clone(),
+        );
+
+        let state = manager.initialize().await.unwrap();
+        let selected = state.selected_adb.unwrap();
+
+        assert_eq!(selected.path, adb_path.to_string_lossy());
+        assert_eq!(selected.source, AdbSource::Bundled);
+        assert_eq!(selected.version, "37.0.1-14129643");
+        assert_eq!(runner.calls().await[0], strings(&["-P", "5038", "version"]));
+        assert_eq!(
+            runner.calls().await[1],
+            strings(&["-P", "5038", "start-server"])
+        );
+        assert_eq!(
+            runner.calls().await[2],
+            strings(&["-P", "5038", "devices", "-l"])
+        );
+        manager.shutdown().await.unwrap();
+        assert_eq!(
+            runner.calls().await[3],
+            strings(&["-P", "5038", "kill-server"])
+        );
+        assert_eq!(server_probe.ports().await, vec![5038, 5038]);
+    }
+
+    #[tokio::test]
+    async fn reclaims_a_stale_server_started_from_the_same_bundled_adb() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let port_text = port.to_string();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643"),
+            success("List of devices attached\n"),
+            success(""),
+        ]));
+        let server_probe = Arc::new(FakeServerProbe::with_identities(vec![
+            bundled_server_identity(&adb_path),
+            bundled_server_identity(&adb_path),
+        ]));
+        let manager = DeviceManager::with_runner_and_bundled_adb_on_port(
+            directory.path().join("config.json"),
+            adb_path,
+            port,
+            runner.clone(),
+            server_probe.clone(),
+        );
+
+        manager.initialize().await.unwrap();
+        manager.shutdown().await.unwrap();
+
+        let calls = runner.calls().await;
+        assert_eq!(calls[1], strings(&["-P", &port_text, "devices", "-l"]));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.last().unwrap() == "start-server")
+        );
+        assert_eq!(calls[2], strings(&["-P", &port_text, "kill-server"]));
+        assert_eq!(server_probe.ports().await, vec![port, port]);
+    }
+
+    #[tokio::test]
+    async fn refuses_to_adopt_or_stop_a_server_started_from_another_adb() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        let other_adb_path = directory.path().join("other-adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![success(
+            "Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643",
+        )]));
+        let server_probe = Arc::new(FakeServerProbe::with_identities(vec![
+            bundled_server_identity(&other_adb_path),
+        ]));
+        let manager = DeviceManager::with_runner_and_bundled_adb_on_port(
+            directory.path().join("config.json"),
+            adb_path,
+            port,
+            runner.clone(),
+            server_probe,
+        );
+
+        let error = manager.initialize().await.unwrap_err();
+        manager.shutdown().await.unwrap();
+
+        assert_eq!(error.code, "BUNDLED_ADB_PORT_UNAVAILABLE");
+        let calls = runner.calls().await;
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.last().unwrap() == "start-server")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.last().unwrap() == "kill-server")
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_adopt_an_old_server_from_the_bundled_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![success(
+            "Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643",
+        )]));
+        let server_probe = Arc::new(FakeServerProbe::with_identities(vec![AdbServerIdentity {
+            version: "36.0.0".to_owned(),
+            executable_absolute_path: adb_path.clone(),
+        }]));
+        let manager = DeviceManager::with_runner_and_bundled_adb_on_port(
+            directory.path().join("config.json"),
+            adb_path,
+            port,
+            runner.clone(),
+            server_probe,
+        );
+
+        let error = manager.initialize().await.unwrap_err();
+        manager.shutdown().await.unwrap();
+
+        assert_eq!(error.code, "BUNDLED_ADB_PORT_UNAVAILABLE");
+        assert_eq!(runner.calls().await.len(), 1);
     }
 
     #[tokio::test]

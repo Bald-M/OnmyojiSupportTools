@@ -18,6 +18,8 @@
 - 新增 Rust 与 Vue 自动化测试、Windows CI、NSIS 与便携 ZIP 构建产物。
 - 新增 Windows x64 与 Windows ARM64 的显式构建命令、原生 CI runner 和 PE 架构校验。
 - 新增跨平台 Windows 构建调度器，在 Windows 使用原生 MSVC，并允许 macOS 通过 `cargo-xwin` 构建 x64 与 ARM64 便携产物。
+- 新增 Windows 安装包内置的 AOSP ADB 37.0.1、完整第三方 NOTICE、来源记录和构建前哈希校验。
+- 新增内置 ADB 候选及外部 ADB 回退入口；没有已保存的用户选择时默认使用内置 ADB。
 - 新增 README、贡献指南、领域词汇、ADR、PR 模板和 Bug/Feature Issue Forms。
 
 ### Changed
@@ -27,6 +29,7 @@
 - 工程版本统一为 `0.1.0`，根包设为私有，许可证元数据统一为 MIT。
 - 桌面支持范围明确为 Windows 10 22H2 与 Windows 11 x64；macOS 暂不提供应用产物或运行支持。
 - 构建产物统一使用包含版本、平台和架构的文件名；Windows ARM64 暂列为实验性目标。
+- 面向用户的 Windows 发布物统一为带标准卸载入口的 NSIS `.exe` 安装包；macOS 交叉构建的便携 ZIP 仅用于开发验证。
 
 ### Fixed
 
@@ -46,6 +49,9 @@
 - ADB 通过程序路径和结构化参数启动，禁止 shell 拼接。
 - 为外部命令增加超时与子进程终止策略。
 - 在 Rust 侧校验 ADB、IP、端口、设备在线状态、截图归属和坐标边界。
-- 不捆绑或下载 ADB，不引入 OnmyojiAutoScript 的 GPLv3 代码或游戏素材。
+- ADB 只在构建阶段从固定的 Google 官方地址获取，并在进入安装包前校验归档和每个分发文件的 SHA-256；应用运行时不下载 ADB。
+- 应用启动时会复核内置 ADB 分发文件的 SHA-256 和固定版本；缺失、损坏或版本异常时提示重新安装或改选外部 ADB。
+- 内置 ADB server 使用应用专用端口 5038，并由 Rust 直接读取 smart-socket `server-status` 核对版本与程序路径；可回收异常退出留下的同版本自有实例，拒绝接管或停止其他 ADB。
+- 不引入 OnmyojiAutoScript 的 GPLv3 代码、游戏素材或模板。
 
 [Unreleased]: https://github.com/Bald-M/OnmyojiSupportTools/commits/main
