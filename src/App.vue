@@ -55,6 +55,7 @@ const status = reactive<{ tone: StatusTone; message: string; recovery: string | 
 })
 let stageResizeObserver: ResizeObserver | null = null
 const adbSourceLabels: Record<AdbSource, string> = {
+  bundled: '应用内置',
   saved: '上次使用',
   muMu12: 'MuMu 12',
   ldPlayer9: '雷电 9',

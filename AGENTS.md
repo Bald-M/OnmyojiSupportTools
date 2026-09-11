@@ -15,7 +15,9 @@
 - Never invoke a shell for ADB. Pass the executable and every argument separately, with a timeout.
 - Preserve one active device. Switching devices invalidates the frame and selected coordinates.
 - Transfer screenshot bytes directly; do not add Base64 or re-encoding.
-- Do not bundle/download ADB or copy OnmyojiAutoScript GPLv3 code, game assets, or templates.
+- Bundle only the pinned, checksum-verified open-source ADB declared in `src-tauri/adb-distribution.json`; never download ADB at application runtime, and preserve its license and notices.
+- Keep the bundled ADB server isolated from external ADB consumers and stop only the server instance owned by this application.
+- Do not copy OnmyojiAutoScript GPLv3 code, game assets, or templates.
 
 ## Completion checks
 

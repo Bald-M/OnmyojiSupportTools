@@ -6,7 +6,7 @@ OnmyojiSupportTools 是一个面向 Windows 的 Android 模拟器辅助桌面应
 
 ## 当前能力
 
-- 从 MuMu 模拟器 12、雷电模拟器 9、系统 `PATH` 和上次配置中发现 ADB。
+- 默认使用安装包内置且经过哈希验证的开源 ADB，也可发现 MuMu 模拟器 12、雷电模拟器 9、系统 `PATH` 和上次配置中的外部 ADB。
 - 验证并选择同一个 `adb.exe` 管理服务器、设备、截图与点击。
 - 展示在线、离线及未授权设备；仅允许选择在线设备。
 - 通过 IP 地址和端口请求 `adb connect`。
@@ -22,7 +22,7 @@ OnmyojiSupportTools 是一个面向 Windows 的 Android 模拟器辅助桌面应
 | Windows | Windows 10 22H2 / Windows 11 x64；Windows 11 ARM64 为实验性构建目标 |
 | 模拟器 | MuMu 模拟器 12、雷电模拟器 9 |
 | WebView | NSIS 安装包可按需调用微软 WebView2 引导程序；便携版要求系统已安装 WebView2 Runtime |
-| ADB | 由用户提供；可使用模拟器自带 ADB 或 Android SDK Platform-Tools |
+| ADB | Windows 安装包内置 AOSP ADB 37.0.1；也可改用模拟器或 Android SDK 提供的外部 ADB |
 
 macOS 目前不提供应用产物或运行支持。macOS 开发机可以交叉编译 Windows 便携产物；核心模块继续保留平台边界，待 Windows 版本稳定后再评估原生 macOS 适配。
 
@@ -37,8 +37,8 @@ ARM64 产物中的应用程序是原生 ARM64 PE；按照 [Tauri Windows 安装�
 
 ## 使用流程
 
-1. 启动受支持的模拟器并开启其 ADB 功能。
-2. 打开应用，选择自动发现的 ADB；若未发现，使用“选择文件”定位 `adb.exe`。
+1. 使用 NSIS `.exe` 安装应用，再启动受支持的模拟器并开启其 ADB 功能。
+2. 打开应用后默认使用内置 ADB；如需兼容特定模拟器，也可选择自动发现或手动定位的外部 `adb.exe`。
 3. 刷新设备列表，选择一台在线设备。只有一台在线设备时会自动选择。
 4. 如设备未出现，可填写模拟器提供的 IP 和端口进行手动连接。
 5. 点击“刷新截图”，在画面内取点或用键盘编辑 X/Y。
@@ -73,20 +73,18 @@ brew install llvm
 cargo install --locked cargo-xwin
 ```
 
-脚本会自动发现 Homebrew 的 LLVM 路径，无需修改 `~/.zshrc`。macOS 交叉构建会校验 PE 架构并生成便携 ZIP，但不生成 NSIS 安装包；安装包由 Windows 原生构建或 GitHub Actions 生成。这只生成 Windows 应用，不代表支持在 macOS 上运行该应用。Tauri 官方将 macOS/Linux 交叉构建标记为带限制的备用方案；正式产物仍以 GitHub Actions 的原生 Windows runner 为准。
+脚本会自动发现 Homebrew 的 LLVM 路径，无需修改 `~/.zshrc`。构建会先取得固定的官方 Platform-Tools 37.0.1 归档，校验归档和安装文件的 SHA-256 后再打包；应用运行时不会下载 ADB。macOS 交叉构建会校验 PE 架构并生成包含 ADB 的诊断用便携 ZIP，但不能生成 NSIS 安装包；面向用户的可卸载安装包由 Windows 原生构建或 GitHub Actions 生成。这只生成 Windows 应用，不代表支持在 macOS 上运行该应用。
 
 `pnpm check` 会执行构建调度器测试、前端 lint、类型检查和测试，以及 Rust 格式、Clippy 和测试。Windows ARM64 原生构建还需要 Visual Studio 的 C++ ARM64 build tools。构建脚本会安装对应 Rust target、调用 Tauri、检查最终 PE Header，并生成带平台和架构的统一产物：
 
 ```text
 artifacts/windows-x64/
   OnmyojiSupportTools_0.1.0_windows_x64_nsis-setup.exe
-  OnmyojiSupportTools_0.1.0_windows_x64_portable.zip
 artifacts/windows-arm64/
   OnmyojiSupportTools_0.1.0_windows_arm64_nsis-setup.exe
-  OnmyojiSupportTools_0.1.0_windows_arm64_portable.zip
 ```
 
-CI 在原生 x64 和 ARM64 Windows runner 上分别构建并上传这些产物；不会自动创建 GitHub Release、签名或启用自动更新。
+CI 在原生 x64 和 ARM64 Windows runner 上分别构建并上传 NSIS 安装包；安装后可通过 Windows“已安装的应用”卸载。CI 不会自动创建 GitHub Release、签名或启用自动更新。macOS 本地交叉构建产生的便携 ZIP 仅用于开发验证，不作为用户发布物。
 
 ## 架构
 
@@ -100,15 +98,17 @@ docs/adr/               架构决策记录
 
 `DeviceManager` 是设备域的唯一入口。Vue 只能调用 `get_app_app_state`、`set_adb_path`、`refresh_devices`、`connect_device`、`select_device`、`capture_screen` 和 `tap_screen`。截图以二进制 IPC 响应传输，不做 Base64 或重复编码；Rust 保存截图尺寸和所属设备，用于点击前验证。
 
-领域术语见 [CONTEXT.md](CONTEXT.md)，关键取舍见 [ADR-0001](docs/adr/0001-rust-tauri-desktop.md)。
+领域术语见 [CONTEXT.md](CONTEXT.md)，桌面架构见 [ADR-0001](docs/adr/0001-rust-tauri-desktop.md)，内置 ADB 的来源、隔离和升级取舍见 [ADR-0002](docs/adr/0002-bundle-auditable-adb.md)。
 
 ## 安全边界
 
 - 外部命令始终以程序路径和结构化参数启动，不经过 shell。
 - 每次 ADB 调用都有超时，超时后终止子进程。
+- 内置 ADB 使用独立的本机 server 端口 `5038`；由 Rust 直接读取 smart-socket 的 `server-status`，无副作用地核对服务端版本和程序路径，只回收同版本、同安装目录的遗留实例，拒绝接管其他 ADB，并在退出前再次核对身份。
+- 启动内置 ADB 前会根据编译进应用的固定清单复核安装目录内各分发文件的 SHA-256 和 ADB 版本；失败时可改选外部 ADB。
 - IP、端口、设备状态、PNG 头和点击边界均在 Rust 侧校验。
 - 配置只保存已验证的 ADB 路径、最后活动设备和最后手动连接端点。
-- 应用不捆绑、不下载 ADB，不提供网络监听或远程控制。
+- 构建阶段只接收并校验固定版本的官方 ADB；应用运行时不下载 ADB，不启动 HTTP 服务，也不提供远程控制。
 - Issue 和 PR 中的截图、设备序列号、用户名路径及日志必须脱敏。
 
 ## 与 OnmyojiAutoScript 的关系
@@ -124,4 +124,4 @@ Windows 基础链路稳定后，计划依次评估任务模型、图像识别/OC
 
 ## 许可证
 
-[MIT](LICENSE)
+应用代码使用 [MIT](LICENSE)。Windows 安装包中的 ADB 及第三方声明见 [ADB 来源与许可证记录](docs/third-party/adb.md)，完整 `NOTICE.txt` 随安装包分发。
