@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { Channel, invoke } from '@tauri-apps/api/core'
 
 import type { AppState, ConnectEndpoint, Point, TapReceipt } from '@/types/device'
 
@@ -29,4 +29,17 @@ export async function captureScreen(): Promise<Uint8Array> {
 
 export function tapScreen(point: Point): Promise<TapReceipt> {
   return invoke('tap_screen', { point })
+}
+
+export function startPreview(
+  onChunk: (chunk: Uint8Array) => void,
+  onEnded: () => void,
+): Promise<AppState> {
+  const channel = new Channel<ArrayBuffer>((payload) => onChunk(new Uint8Array(payload)))
+  const endedChannel = new Channel<string>(() => onEnded())
+  return invoke('start_preview', { onChunk: channel, onEnded: endedChannel })
+}
+
+export function stopPreview(): Promise<AppState> {
+  return invoke('stop_preview')
 }

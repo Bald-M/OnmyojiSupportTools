@@ -15,12 +15,13 @@
 - 新增在线、离线、未授权设备展示，单活动设备选择和 IP/端口连接。
 - 新增二进制 PNG 截图 IPC、截图尺寸校验、缩放/留白坐标换算和显式点击确认。
 - 新增明暗主题、键盘坐标输入、可见焦点、禁用状态和可恢复错误反馈。
-- 新增 Rust 与 Vue 自动化测试、Windows CI、NSIS 与便携 ZIP 构建产物。
-- 新增 Windows x64 与 Windows ARM64 的显式构建命令、原生 CI runner 和 PE 架构校验。
-- 新增跨平台 Windows 构建调度器，在 Windows 使用原生 MSVC，并允许 macOS 通过 `cargo-xwin` 构建 x64 与 ARM64 便携产物。
+- 新增 Rust 与 Vue 自动化测试、Windows CI、NSIS 构建产物。
+- 新增 Windows x64 的显式构建命令、原生 CI runner 和 PE 架构校验。
+- 新增跨平台 Windows 构建调度器，在 Windows 使用原生 MSVC，并允许 macOS 通过 `cargo-xwin` 构建 x64 NSIS 安装包。
 - 新增 Windows 安装包内置的 AOSP ADB 37.0.1、完整第三方 NOTICE、来源记录和构建前哈希校验。
 - 新增内置 ADB 候选及外部 ADB 回退入口；没有已保存的用户选择时默认使用内置 ADB。
 - 新增 README、贡献指南、领域词汇、ADR、PR 模板和 Bug/Feature Issue Forms。
+- 新增可显式开始、停止和重新开始的 H.264 实时预览原型；预览仍保持只选点、显式点击和单活动设备约束。
 
 ### Changed
 
@@ -28,8 +29,8 @@
 - 移除 Koa HTTP 后端和浏览器部署路径，所有设备能力改由受控 Tauri IPC 暴露。
 - 工程版本统一为 `0.1.0`，根包设为私有，许可证元数据统一为 MIT。
 - 桌面支持范围明确为 Windows 10 22H2 与 Windows 11 x64；macOS 暂不提供应用产物或运行支持。
-- 构建产物统一使用包含版本、平台和架构的文件名；Windows ARM64 暂列为实验性目标。
-- 面向用户的 Windows 发布物统一为带标准卸载入口的 NSIS `.exe` 安装包；macOS 交叉构建的便携 ZIP 仅用于开发验证。
+- 构建仅保留 Windows x64 目标，产物统一使用包含版本、平台和架构的文件名。
+- 面向用户的 Windows 发布物统一为带标准卸载入口的 NSIS `.exe` 安装包；Windows 与 macOS 构建完成后都清空 `dist/` 并只保留该安装包。
 
 ### Fixed
 

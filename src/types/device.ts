@@ -44,6 +44,7 @@ export interface AppState {
   activeDeviceSerial: string | null
   lastFrame: FrameSummary | null
   lastEndpoint: ConnectEndpoint | null
+  previewDeviceSerial: string | null
 }
 
 export interface AppError {

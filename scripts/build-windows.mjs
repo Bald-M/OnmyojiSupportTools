@@ -2,11 +2,10 @@ import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
 } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -20,10 +19,6 @@ const ARCHITECTURES = Object.freeze({
     target: "x86_64-pc-windows-msvc",
     expectedMachine: 0x8664,
   }),
-  arm64: Object.freeze({
-    target: "aarch64-pc-windows-msvc",
-    expectedMachine: 0xaa64,
-  }),
 });
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -32,7 +27,7 @@ export function createBuildPlan({ architecture, hostPlatform = process.platform 
   const targetConfig = ARCHITECTURES[architecture];
   if (!targetConfig) {
     throw new Error(
-      `Unsupported Windows architecture "${architecture}". Expected x64 or arm64.`,
+      `Unsupported Windows architecture "${architecture}". Expected x64.`,
     );
   }
 
@@ -55,8 +50,8 @@ export function createBuildPlan({ architecture, hostPlatform = process.platform 
       ...targetConfig,
       bundledAdbVersion: BUNDLED_ADB.version,
       hostPlatform,
-      producesInstaller: false,
-      producesPortableArtifact: true,
+      producesInstaller: true,
+      producesPortableArtifact: false,
       runner: "cargo-xwin",
       strategy: "cross-compile",
     };
@@ -84,7 +79,7 @@ function parseArguments(arguments_) {
   }
 
   if (!architecture) {
-    throw new Error("Missing --architecture. Expected x64 or arm64.");
+    throw new Error("Missing --architecture. Expected x64.");
   }
 
   return { architecture, dryRun };
@@ -142,12 +137,17 @@ function prepareMacEnvironment() {
   if (!llvmBin) {
     missing.push("LLVM (`brew install llvm`)");
   }
+  if (!commandSucceeds("makensis", ["-VERSION"], process.env)) {
+    missing.push("NSIS (`brew install nsis`)");
+  }
   if (missing.length > 0) {
     throw new Error(`Missing macOS Windows-build dependencies: ${missing.join(", ")}.`);
   }
 
   return {
     ...process.env,
+    LANG: "en_US.UTF-8",
+    LC_ALL: "en_US.UTF-8",
     PATH: `${llvmBin}${delimiter}${process.env.PATH ?? ""}`,
   };
 }
@@ -174,7 +174,17 @@ function assertPeArchitecture(path, expectedMachine) {
   }
 }
 
-function packageMacPortableArtifact(plan, version, env) {
+export function installerFileName(version) {
+  return `OnmyojiSupportTools_${version}_windows_x64_nsis-setup.exe`;
+}
+
+export function replaceDistributionDirectory(source, destination, outputDirectory) {
+  rmSync(outputDirectory, { recursive: true, force: true });
+  mkdirSync(outputDirectory, { recursive: true });
+  copyFileSync(source, destination);
+}
+
+function publishMacInstaller(plan, version) {
   const targetRoot = join(
     repositoryRoot,
     "src-tauri",
@@ -183,42 +193,35 @@ function packageMacPortableArtifact(plan, version, env) {
     "release",
   );
   const binaryPath = join(targetRoot, "onmyoji-support-tools.exe");
-  const artifactDirectory = join(
-    repositoryRoot,
-    "artifacts",
-    `windows-${plan.architecture}`,
-  );
-  const artifactStem = `OnmyojiSupportTools_${version}_windows_${plan.architecture}`;
-  const portableZipPath = join(artifactDirectory, `${artifactStem}_portable.zip`);
+  const bundleDirectory = join(targetRoot, "bundle", "nsis");
+  const outputDirectory = join(repositoryRoot, "dist");
+  const installerPath = join(outputDirectory, installerFileName(version));
 
   if (!existsSync(binaryPath)) {
     throw new Error(`Tauri did not produce the expected executable: ${binaryPath}`);
   }
   assertPeArchitecture(binaryPath, plan.expectedMachine);
 
-  mkdirSync(artifactDirectory, { recursive: true });
-  const stagingDirectory = mkdtempSync(join(artifactDirectory, ".portable-"));
-  rmSync(portableZipPath, { force: true });
-  try {
-    copyFileSync(binaryPath, join(stagingDirectory, "OnmyojiSupportTools.exe"));
-    cpSync(
-      join(repositoryRoot, "src-tauri", "generated", "adb"),
-      join(stagingDirectory, "adb"),
-      { recursive: true },
+  const installers = readdirSync(bundleDirectory, { withFileTypes: true })
+    .filter(
+      (entry) =>
+        entry.isFile() &&
+        entry.name.includes(version) &&
+        entry.name.endsWith(".exe"),
+    )
+    .map((entry) => join(bundleDirectory, entry.name));
+  if (installers.length !== 1) {
+    throw new Error(
+      `Expected exactly one NSIS installer in ${bundleDirectory}, found ${installers.length}.`,
     );
-    runChecked("/usr/bin/zip", ["-r", "-q", portableZipPath, "."], {
-      cwd: stagingDirectory,
-      env,
-    });
-  } finally {
-    rmSync(stagingDirectory, { recursive: true, force: true });
   }
+
+  replaceDistributionDirectory(installers[0], installerPath, outputDirectory);
 
   process.stdout.write(
     `Verified platform=windows architecture=${plan.architecture} target=${plan.target}\n`,
   );
-  process.stdout.write("NSIS: skipped on macOS; use a native Windows build or CI\n");
-  process.stdout.write(`Diagnostic portable ZIP: ${portableZipPath}\n`);
+  process.stdout.write(`NSIS: ${installerPath}\n`);
 }
 
 function buildOnMac(plan) {
@@ -240,12 +243,11 @@ function buildOnMac(plan) {
       plan.runner,
       "--target",
       plan.target,
-      "--no-bundle",
       "--ci",
     ],
     { env },
   );
-  packageMacPortableArtifact(plan, packageJson.version, env);
+  publishMacInstaller(plan, packageJson.version);
 }
 
 function buildOnWindows(plan) {

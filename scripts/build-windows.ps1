@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("x64", "arm64")]
+    [ValidateSet("x64")]
     [string]$Architecture
 )
 
@@ -13,12 +13,10 @@ if ($env:OS -ne "Windows_NT") {
 }
 
 $Targets = @{
-    x64   = "x86_64-pc-windows-msvc"
-    arm64 = "aarch64-pc-windows-msvc"
+    x64 = "x86_64-pc-windows-msvc"
 }
 $ExpectedMachine = @{
-    x64   = 0x8664
-    arm64 = 0xAA64
+    x64 = 0x8664
 }
 
 $Target = $Targets[$Architecture]
@@ -28,9 +26,9 @@ $Version = $Package.version
 $TargetRoot = Join-Path $RepositoryRoot "src-tauri/target/$Target/release"
 $BinaryPath = Join-Path $TargetRoot "onmyoji-support-tools.exe"
 $BundleDirectory = Join-Path $TargetRoot "bundle/nsis"
-$ArtifactDirectory = Join-Path $RepositoryRoot "artifacts/windows-$Architecture"
-$ArtifactStem = "OnmyojiSupportTools_${Version}_windows_${Architecture}"
-$InstallerPath = Join-Path $ArtifactDirectory "${ArtifactStem}_nsis-setup.exe"
+$DistributionDirectory = Join-Path $RepositoryRoot "dist"
+$InstallerName = "OnmyojiSupportTools_${Version}_windows_x64_nsis-setup.exe"
+$InstallerPath = Join-Path $DistributionDirectory $InstallerName
 
 function Invoke-CheckedCommand {
     param(
@@ -97,12 +95,13 @@ try {
     }
     $GeneratedInstallerPath = $Installers[0].FullName
 
-    New-Item -ItemType Directory -Force -Path $ArtifactDirectory | Out-Null
+    Remove-Item -LiteralPath $DistributionDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force -Path $DistributionDirectory | Out-Null
     Copy-Item -LiteralPath $GeneratedInstallerPath -Destination $InstallerPath -Force
 
     if ($env:GITHUB_OUTPUT) {
         "target=$Target" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-        "installer_path=artifacts/windows-$Architecture/${ArtifactStem}_nsis-setup.exe" |
+        "installer_path=dist/$InstallerName" |
             Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
     }
 

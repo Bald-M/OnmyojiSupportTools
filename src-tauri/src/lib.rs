@@ -1,9 +1,15 @@
 mod device;
+mod preview;
 
 use std::path::PathBuf;
 
 use device::{AppError, AppState, ConnectEndpoint, DeviceManager, Point, TapReceipt};
-use tauri::{Manager, State, ipc::Response};
+use std::sync::Arc;
+
+use tauri::{
+    Manager, State,
+    ipc::{Channel, InvokeResponseBody, Response},
+};
 
 #[tauri::command]
 async fn get_app_app_state(manager: State<'_, DeviceManager>) -> Result<AppState, AppError> {
@@ -52,6 +58,29 @@ async fn tap_screen(
     manager.tap_screen(point).await
 }
 
+#[tauri::command]
+async fn start_preview(
+    on_chunk: Channel<InvokeResponseBody>,
+    on_ended: Channel<String>,
+    manager: State<'_, DeviceManager>,
+) -> Result<AppState, AppError> {
+    manager
+        .start_preview(
+            Arc::new(move |bytes| {
+                let _ = on_chunk.send(InvokeResponseBody::Raw(bytes));
+            }),
+            Arc::new(move || {
+                let _ = on_ended.send("ended".to_owned());
+            }),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn stop_preview(manager: State<'_, DeviceManager>) -> Result<AppState, AppError> {
+    manager.stop_preview().await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -73,7 +102,9 @@ pub fn run() {
             connect_device,
             select_device,
             capture_screen,
-            tap_screen
+            tap_screen,
+            start_preview,
+            stop_preview
         ])
         .build(tauri::generate_context!())
         .expect("failed to build OnmyojiSupportTools");

@@ -308,6 +308,11 @@ select:hover {
   border-bottom: 1px solid var(--border);
 }
 
+.frame-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .panel h2,
 .inspector-heading h2 {
   font-size: 15px;
@@ -337,12 +342,21 @@ select:hover {
   cursor: crosshair;
 }
 
-.screenshot-stage img {
+.screenshot-stage img,
+.preview-canvas {
   width: 100%;
   height: 100%;
   object-fit: contain;
   user-select: none;
   pointer-events: none;
+}
+
+.preview-canvas {
+  display: none;
+}
+
+.preview-canvas.visible {
+  display: block;
 }
 
 .empty-state {

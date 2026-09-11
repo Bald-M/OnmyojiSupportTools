@@ -10,7 +10,7 @@ Closes #
 
 - [ ] `pnpm check`
 - [ ] `pnpm frontend:build`
-- [ ] 已执行受影响的 Windows x64 / ARM64 构建，或已说明未执行原因
+- [ ] 已执行 Windows x64 构建，或已说明未执行原因
 - [ ] 已完成受影响的 Windows / 模拟器手工流程
 
 请列出具体测试环境与结果：

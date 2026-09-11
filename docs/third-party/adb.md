@@ -27,4 +27,4 @@ ADB 的 AOSP 源码使用 Apache License 2.0；官方归档中的完整 `NOTICE.
 
 截至 2026-09-10，上游 ADB 仓库没有发布名为 `platform-tools-37.0.1` 的公开 tag，因此本项目不把任意源码 commit 冒充官方二进制的精确构建输入。当前可复核链路锚定 Google 官方版本说明、仓库元数据中的版本与 SHA-1、固定归档 SHA-256、`source.properties` 及每个分发文件的 SHA-256；若上游补发对应 tag，升级审计时应把它补入清单。
 
-上述 Windows 文件是 PE32 x86 程序。Windows x64 是主要验收目标；Windows ARM64 产物仍为实验性，必须在 ARM64 真机上验证 ADB、模拟器和卸载流程后才能声明兼容。
+上述 Windows 文件是 PE32 x86 程序，随唯一受支持的 Windows x64 安装包分发。

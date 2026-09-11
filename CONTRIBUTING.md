@@ -17,7 +17,7 @@
 ```text
 feat(device): discover emulator adb
 fix(capture): reject a stale screenshot
-docs: explain portable WebView2 requirement
+docs: explain installer WebView2 requirement
 ```
 
 允许的类型为 `feat`、`fix`、`docs`、`refactor`、`perf`、`test`、`build`、`ci`、`chore`。破坏性变更使用 `!` 并在 PR 中写明迁移方式。
@@ -39,10 +39,9 @@ pnpm install --frozen-lockfile
 pnpm check
 pnpm frontend:build
 pnpm build:windows:x64
-pnpm build:windows:arm64
 ```
 
-Windows 上的两个桌面构建使用原生 MSVC，ARM64 还需要 Visual Studio C++ ARM64 build tools，并生成面向用户的 NSIS 安装包。macOS 可先执行 `brew install llvm` 和 `cargo install --locked cargo-xwin`，再通过相同命令交叉编译仅用于开发验证的便携 ZIP；可卸载安装包仍由原生 Windows 或 CI 构建。若未执行某个架构，请在 PR 中说明，CI 会在对应原生 Windows runner 上复核。
+Windows x64 桌面构建使用原生 MSVC 并生成面向用户的 NSIS 安装包。macOS 可先执行 `brew install llvm nsis` 和 `cargo install --locked cargo-xwin`，再通过相同命令交叉编译 Windows x64 NSIS 安装包。构建完成后 `dist/` 只保留一个带版本、平台和架构名称的安装包；若未执行 Windows 构建，请在 PR 中说明，CI 会在原生 Windows runner 上复核。
 
 涉及设备流程时，按影响范围执行 [Windows 验收矩阵](docs/windows-acceptance.md)：自动/手动 ADB、单/多设备、IP 连接、截图、缩放取点、点击，以及离线、未授权和超时恢复。
 
