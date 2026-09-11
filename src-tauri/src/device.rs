@@ -19,6 +19,10 @@ use tokio::{
     time::timeout,
 };
 
+use crate::preview::{
+    AdbScreenrecordPreviewBackend, PreviewBackend, PreviewController, PreviewEndSink, PreviewSink,
+};
+
 const ADB_TIMEOUT: Duration = Duration::from_secs(8);
 const BUNDLED_ADB_SERVER_PORT: u16 = 5038;
 const BUNDLED_ADB_DISTRIBUTION_JSON: &str = include_str!("../adb-distribution.json");
@@ -115,6 +119,7 @@ pub struct AppState {
     pub active_device_serial: Option<String>,
     pub last_frame: Option<FrameSummary>,
     pub last_endpoint: Option<ConnectEndpoint>,
+    pub preview_device_serial: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
@@ -126,7 +131,11 @@ pub struct AppError {
 }
 
 impl AppError {
-    fn new(code: &'static str, message: impl Into<String>, recovery: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        code: &'static str,
+        message: impl Into<String>,
+        recovery: impl Into<String>,
+    ) -> Self {
         Self {
             code,
             message: message.into(),
@@ -273,6 +282,7 @@ pub struct DeviceManager {
     bundled_server_owned: Mutex<bool>,
     server_probe: Arc<dyn AdbServerProbe>,
     state: RwLock<RuntimeState>,
+    preview: PreviewController,
 }
 
 impl DeviceManager {
@@ -284,6 +294,7 @@ impl DeviceManager {
             BUNDLED_ADB_SERVER_PORT,
             Arc::new(ProcessRunner),
             Arc::new(SmartSocketAdbServerProbe),
+            Arc::new(AdbScreenrecordPreviewBackend),
         )
     }
 
@@ -296,6 +307,7 @@ impl DeviceManager {
             BUNDLED_ADB_SERVER_PORT,
             runner,
             Arc::new(SmartSocketAdbServerProbe),
+            Arc::new(AdbScreenrecordPreviewBackend),
         )
     }
 
@@ -313,6 +325,7 @@ impl DeviceManager {
             BUNDLED_ADB_SERVER_PORT,
             runner,
             server_probe,
+            Arc::new(AdbScreenrecordPreviewBackend),
         )
     }
 
@@ -331,6 +344,7 @@ impl DeviceManager {
             bundled_server_port,
             runner,
             server_probe,
+            Arc::new(AdbScreenrecordPreviewBackend),
         )
     }
 
@@ -341,6 +355,7 @@ impl DeviceManager {
         bundled_server_port: u16,
         runner: Arc<dyn CommandRunner>,
         server_probe: Arc<dyn AdbServerProbe>,
+        preview_backend: Arc<dyn PreviewBackend>,
     ) -> Self {
         Self {
             runner,
@@ -351,7 +366,25 @@ impl DeviceManager {
             bundled_server_owned: Mutex::new(false),
             server_probe,
             state: RwLock::new(RuntimeState::default()),
+            preview: PreviewController::new(preview_backend),
         }
+    }
+
+    #[cfg(test)]
+    fn with_runner_and_preview_backend(
+        config_path: PathBuf,
+        runner: Arc<dyn CommandRunner>,
+        preview_backend: Arc<dyn PreviewBackend>,
+    ) -> Self {
+        Self::with_runner_and_optional_bundled_adb(
+            config_path,
+            None,
+            BundledAdbIntegrity::Skip,
+            BUNDLED_ADB_SERVER_PORT,
+            runner,
+            Arc::new(SmartSocketAdbServerProbe),
+            preview_backend,
+        )
     }
 
     pub async fn initialize(&self) -> Result<AppState, AppError> {
@@ -408,6 +441,7 @@ impl DeviceManager {
             .map(|candidate| candidate.source)
             .unwrap_or(AdbSource::Manual);
         let candidate = self.validate_adb(&path, source).await?;
+        self.preview.stop().await;
         {
             let mut state = self.state.write().await;
             state.initialized = true;
@@ -455,6 +489,10 @@ impl DeviceManager {
             .or_else(|| saved.filter(|serial| online.contains(serial)))
             .or_else(|| (online.len() == 1).then(|| online[0].clone()));
 
+        if self.preview.active_device_serial().await != active {
+            self.preview.stop().await;
+        }
+
         if active != state.active_device_serial {
             state.last_frame = None;
         }
@@ -462,7 +500,8 @@ impl DeviceManager {
         state.active_device_serial = active.clone();
         state.config.active_device_serial = active;
         self.save_config(&state.config)?;
-        Ok(snapshot_from(&state))
+        drop(state);
+        Ok(self.snapshot().await)
     }
 
     pub async fn connect_device(&self, endpoint: ConnectEndpoint) -> Result<AppState, AppError> {
@@ -490,8 +529,10 @@ impl DeviceManager {
     }
 
     pub async fn select_device(&self, serial: String) -> Result<AppState, AppError> {
-        let mut state = self.state.write().await;
-        let available = state
+        let available = self
+            .state
+            .read()
+            .await
             .devices
             .iter()
             .any(|device| device.serial == serial && device.status == DeviceStatus::Online);
@@ -503,13 +544,19 @@ impl DeviceManager {
             ));
         }
 
+        if self.preview.active_device_serial().await.as_deref() != Some(&serial) {
+            self.preview.stop().await;
+        }
+        let mut state = self.state.write().await;
+
         if state.active_device_serial.as_deref() != Some(&serial) {
             state.last_frame = None;
         }
         state.active_device_serial = Some(serial.clone());
         state.config.active_device_serial = Some(serial);
         self.save_config(&state.config)?;
-        Ok(snapshot_from(&state))
+        drop(state);
+        Ok(self.snapshot().await)
     }
 
     pub async fn capture_screen(&self) -> Result<Vec<u8>, AppError> {
@@ -594,7 +641,52 @@ impl DeviceManager {
         })
     }
 
+    pub async fn start_preview(
+        &self,
+        sink: PreviewSink,
+        on_end: PreviewEndSink,
+    ) -> Result<AppState, AppError> {
+        let (adb, serial) = self.active_command_context().await?;
+        self.ensure_bundled_server(&adb).await?;
+        let args = self.adb_args(
+            &adb,
+            &[
+                "-s",
+                &serial,
+                "exec-out",
+                "screenrecord",
+                "--output-format=h264",
+                "--size",
+                "1280x720",
+                "--bit-rate",
+                "8000000",
+                "-",
+            ],
+        );
+        self.preview
+            .start(&adb, &args, serial.clone(), sink, on_end)
+            .await?;
+        let mut state = self.state.write().await;
+        state.last_frame = Some(FrameSummary {
+            width: 1280,
+            height: 720,
+            device_serial: serial.clone(),
+            captured_at: epoch_millis(),
+        });
+        drop(state);
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn stop_preview(&self) -> Result<AppState, AppError> {
+        self.preview.stop().await;
+        let mut state = self.state.write().await;
+        state.last_frame = None;
+        drop(state);
+        Ok(self.snapshot().await)
+    }
+
     pub async fn shutdown(&self) -> Result<(), AppError> {
+        self.preview.stop().await;
         let mut owned = self.bundled_server_owned.lock().await;
         if !*owned {
             return Ok(());
@@ -787,7 +879,10 @@ impl DeviceManager {
 
     async fn snapshot(&self) -> AppState {
         let state = self.state.read().await;
-        snapshot_from(&state)
+        let mut snapshot = snapshot_from(&state);
+        drop(state);
+        snapshot.preview_device_serial = self.preview.active_device_serial().await;
+        snapshot
     }
 
     fn load_config(&self) -> Result<StoredConfig, AppError> {
@@ -942,6 +1037,7 @@ fn snapshot_from(state: &RuntimeState) -> AppState {
         active_device_serial: state.active_device_serial.clone(),
         last_frame: state.last_frame.clone(),
         last_endpoint: state.config.last_endpoint.clone(),
+        preview_device_serial: None,
     }
 }
 
@@ -1261,7 +1357,10 @@ mod tests {
         collections::VecDeque,
         net::TcpListener,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -1275,10 +1374,44 @@ mod tests {
         parse_endpoint, query_adb_server_identity, select_initial_adb, strings,
         validate_bundled_adb_files, validate_png,
     };
+    use crate::preview::{PreviewBackend, PreviewEndSink, PreviewSessionHandle, PreviewSink};
 
     struct FakeRunner {
         outputs: Mutex<VecDeque<Result<CommandOutput, AppError>>>,
         calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    struct FakePreviewBackend {
+        calls: Mutex<Vec<Vec<String>>>,
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    struct FakePreviewSession {
+        stop_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl PreviewSessionHandle for FakePreviewSession {
+        async fn stop(self: Box<Self>) {
+            self.stop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl PreviewBackend for FakePreviewBackend {
+        async fn start(
+            &self,
+            _program: &Path,
+            args: &[String],
+            _sink: PreviewSink,
+            _on_end: PreviewEndSink,
+            _live: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Result<Box<dyn PreviewSessionHandle>, AppError> {
+            self.calls.lock().await.push(args.to_vec());
+            Ok(Box::new(FakePreviewSession {
+                stop_count: self.stop_count.clone(),
+            }))
+        }
     }
 
     impl FakeRunner {
@@ -1799,6 +1932,101 @@ mod tests {
             state.active_device_serial.as_deref(),
             Some("127.0.0.1:16384")
         );
+    }
+
+    #[tokio::test]
+    async fn preview_uses_the_selected_adb_and_stops_when_the_device_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nfirst device\nsecond device\n"),
+        ]));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        let preview = Arc::new(FakePreviewBackend {
+            calls: Mutex::new(Vec::new()),
+            stop_count: stop_count.clone(),
+        });
+        let manager = DeviceManager::with_runner_and_preview_backend(
+            directory.path().join("config.json"),
+            runner,
+            preview.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.select_device("first".to_owned()).await.unwrap();
+
+        let state = manager
+            .start_preview(Arc::new(|_| {}), Arc::new(|| {}))
+            .await
+            .unwrap();
+
+        assert_eq!(state.preview_device_serial.as_deref(), Some("first"));
+        assert_eq!(
+            state
+                .last_frame
+                .as_ref()
+                .map(|frame| (frame.width, frame.height)),
+            Some((1280, 720))
+        );
+        assert_eq!(
+            preview.calls.lock().await[0],
+            strings(&[
+                "-s",
+                "first",
+                "exec-out",
+                "screenrecord",
+                "--output-format=h264",
+                "--size",
+                "1280x720",
+                "--bit-rate",
+                "8000000",
+                "-"
+            ])
+        );
+
+        manager.select_device("second".to_owned()).await.unwrap();
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+        let state = manager.snapshot().await;
+        assert!(state.preview_device_serial.is_none());
+        assert!(state.last_frame.is_none());
+    }
+
+    #[tokio::test]
+    async fn stopping_preview_invalidates_coordinates_and_allows_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nfirst device\n"),
+        ]));
+        let stop_count = Arc::new(AtomicUsize::new(0));
+        let preview = Arc::new(FakePreviewBackend {
+            calls: Mutex::new(Vec::new()),
+            stop_count: stop_count.clone(),
+        });
+        let manager = DeviceManager::with_runner_and_preview_backend(
+            directory.path().join("config.json"),
+            runner,
+            preview,
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+
+        manager
+            .start_preview(Arc::new(|_| {}), Arc::new(|| {}))
+            .await
+            .unwrap();
+        let stopped = manager.stop_preview().await.unwrap();
+        assert!(stopped.preview_device_serial.is_none());
+        assert!(stopped.last_frame.is_none());
+        assert_eq!(stop_count.load(Ordering::SeqCst), 1);
+
+        let restarted = manager
+            .start_preview(Arc::new(|_| {}), Arc::new(|| {}))
+            .await
+            .unwrap();
+        assert_eq!(restarted.preview_device_serial.as_deref(), Some("first"));
     }
 
     #[tokio::test]

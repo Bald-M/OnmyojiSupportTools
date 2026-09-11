@@ -21,6 +21,7 @@
 - 新增 Windows 安装包内置的 AOSP ADB 37.0.1、完整第三方 NOTICE、来源记录和构建前哈希校验。
 - 新增内置 ADB 候选及外部 ADB 回退入口；没有已保存的用户选择时默认使用内置 ADB。
 - 新增 README、贡献指南、领域词汇、ADR、PR 模板和 Bug/Feature Issue Forms。
+- 新增可显式开始、停止和重新开始的 H.264 实时预览原型；预览仍保持只选点、显式点击和单活动设备约束。
 
 ### Changed
 

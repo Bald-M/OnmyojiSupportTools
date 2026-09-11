@@ -12,6 +12,8 @@ const device = vi.hoisted(() => ({
   selectDevice: vi.fn(),
   captureScreen: vi.fn(),
   tapScreen: vi.fn(),
+  startPreview: vi.fn(),
+  stopPreview: vi.fn(),
 }))
 
 vi.mock('./lib/device', () => device)
@@ -31,6 +33,7 @@ const readyState: AppState = {
   activeDeviceSerial: '127.0.0.1:16384',
   lastFrame: null,
   lastEndpoint: null,
+  previewDeviceSerial: null,
 }
 
 describe('desktop device workflow', () => {
@@ -43,6 +46,8 @@ describe('desktop device workflow', () => {
       point: { x: 640, y: 360 },
       completedAt: 1,
     })
+    device.startPreview.mockResolvedValue({ ...readyState, previewDeviceSerial: readyState.activeDeviceSerial })
+    device.stopPreview.mockResolvedValue(readyState)
   })
 
   it('requires an explicit action after choosing a screenshot coordinate', async () => {
@@ -148,5 +153,57 @@ describe('desktop device workflow', () => {
     expect(options[2]?.text()).toContain('未授权')
     expect(options[2]?.attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="capture-button"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('starts and stops preview explicitly without tapping the device', async () => {
+    const wrapper = mount(App)
+    await flushPromises()
+
+    await wrapper.get('[data-testid="preview-button"]').trigger('click')
+    await flushPromises()
+    expect(device.startPreview).toHaveBeenCalledOnce()
+    expect(device.tapScreen).not.toHaveBeenCalled()
+
+    const stage = wrapper.get('[data-testid="screenshot-stage"]')
+    vi.spyOn(stage.element, 'getBoundingClientRect').mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 1280,
+      height: 720,
+      right: 1280,
+      bottom: 720,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    })
+    await stage.trigger('click', { clientX: 320, clientY: 180 })
+    expect((wrapper.get('#coordinate-x').element as HTMLInputElement).value).toBe('320')
+    expect((wrapper.get('#coordinate-y').element as HTMLInputElement).value).toBe('180')
+    expect(device.tapScreen).not.toHaveBeenCalled()
+
+    await wrapper.get('[data-testid="preview-button"]').trigger('click')
+    await flushPromises()
+    expect(device.stopPreview).toHaveBeenCalledOnce()
+  })
+
+  it('returns to static capture when the preview stream ends', async () => {
+    let endPreview = () => {}
+    device.startPreview.mockImplementationOnce(
+      (_onChunk: (chunk: Uint8Array) => void, onEnded: () => void) => {
+        endPreview = onEnded
+        return Promise.resolve({ ...readyState, previewDeviceSerial: readyState.activeDeviceSerial })
+      },
+    )
+    const wrapper = mount(App)
+    await flushPromises()
+    await wrapper.get('[data-testid="preview-button"]').trigger('click')
+    await flushPromises()
+
+    endPreview()
+    await flushPromises()
+
+    expect(device.stopPreview).toHaveBeenCalledOnce()
+    expect(wrapper.get('[data-testid="capture-button"]').attributes('disabled')).toBeUndefined()
+    expect(wrapper.get('.status-bar').text()).toContain('刷新截图')
   })
 })

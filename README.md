@@ -12,8 +12,9 @@ OnmyojiSupportTools 是一个面向 Windows 的 Android 模拟器辅助桌面应
 - 通过 IP 地址和端口请求 `adb connect`。
 - 手动获取 PNG 截图，在缩放或留白后的画面中准确换算坐标。
 - 单击画面只选择坐标；只有明确按下“执行点击”才向设备发送操作。
+- 提供一个显式开始/停止的实时预览原型，用于在 Windows x64 + MuMu 12 上验证 WebView2 H.264 低延迟解码；未完成实测前仍以静态截图为受支持的精确取点方式。
 
-以下能力不属于 `0.1.0`：多设备并发、实时预览、图像识别、OCR、任务运行时、调度器、插件、远程控制、自动更新和 macOS 发布。
+以下能力不属于 `0.1.0`：正式实时预览、多设备并发、图像识别、OCR、任务运行时、调度器、插件、远程控制、自动更新和 macOS 发布。
 
 ## 系统要求
 
@@ -40,6 +41,8 @@ macOS 目前不提供原生应用或运行支持，但开发机可以交叉编�
 4. 如设备未出现，可填写模拟器提供的 IP 和端口进行手动连接。
 5. 点击“刷新截图”，在画面内取点或用键盘编辑 X/Y。
 6. 检查坐标后点击“执行点击”。切换设备会清除旧截图和坐标。
+
+也可点击“实时预览（原型）”验证连续画面。此路径临时使用 Android `screenrecord` 输出的 H.264 Annex-B 流和 WebView2 WebCodecs，默认录制时长及编码能力受设备实现限制；停止后可立即重新开始。解码不可用或失败时，停止预览并回到“刷新截图”。Windows 实测方法与结果表见 [Issue #4 实时预览原型](docs/prototypes/issue-4-live-preview.md)。
 
 ## 本地开发
 
@@ -91,9 +94,9 @@ docs/adr/               架构决策记录
 .github/                CI、Issue Form 与 PR 模板
 ```
 
-`DeviceManager` 是设备域的唯一入口。Vue 只能调用 `get_app_app_state`、`set_adb_path`、`refresh_devices`、`connect_device`、`select_device`、`capture_screen` 和 `tap_screen`。截图以二进制 IPC 响应传输，不做 Base64 或重复编码；Rust 保存截图尺寸和所属设备，用于点击前验证。
+`DeviceManager` 是设备域的唯一入口。Vue 只能调用 `get_app_app_state`、`set_adb_path`、`refresh_devices`、`connect_device`、`select_device`、`capture_screen`、`tap_screen`、`start_preview` 和 `stop_preview`。截图与原型视频块均以二进制 IPC 传输，不做 Base64；Rust 保存画面尺寸和所属设备，用于点击前验证。
 
-领域术语见 [CONTEXT.md](CONTEXT.md)，桌面架构见 [ADR-0001](docs/adr/0001-rust-tauri-desktop.md)，内置 ADB 的来源、隔离和升级取舍见 [ADR-0002](docs/adr/0002-bundle-auditable-adb.md)。
+领域术语见 [CONTEXT.md](CONTEXT.md)，桌面架构见 [ADR-0001](docs/adr/0001-rust-tauri-desktop.md)，内置 ADB 的来源、隔离和升级取舍见 [ADR-0002](docs/adr/0002-bundle-auditable-adb.md)，实时预览原型边界见 [ADR-0003](docs/adr/0003-prototype-webview2-h264-preview.md)。
 
 ## 安全边界
 

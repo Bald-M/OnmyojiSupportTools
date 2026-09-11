@@ -8,6 +8,8 @@ import {
   MousePointerClick,
   PlugZap,
   RefreshCw,
+  Video,
+  Square,
 } from '@lucide/vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
@@ -20,11 +22,14 @@ import {
   refreshDevices,
   selectDevice,
   setAdbPath,
+  startPreview,
+  stopPreview,
   tapScreen,
 } from './lib/device'
+import { H264CanvasDecoder } from './lib/h264'
 import type { AdbSource, AppError, AppState, DeviceStatus } from './types/device'
 
-type Operation = 'initialize' | 'adb' | 'devices' | 'connect' | 'capture' | 'tap'
+type Operation = 'initialize' | 'adb' | 'devices' | 'connect' | 'capture' | 'preview' | 'tap'
 type StatusTone = 'neutral' | 'success' | 'error'
 
 const emptyState: AppState = {
@@ -34,12 +39,14 @@ const emptyState: AppState = {
   activeDeviceSerial: null,
   lastFrame: null,
   lastEndpoint: null,
+  previewDeviceSerial: null,
 }
 
 const appState = ref<AppState>(emptyState)
 const busy = ref<Operation | null>('initialize')
 const screenshotUrl = shallowRef<string | null>(null)
 const screenshotStage = ref<HTMLElement | null>(null)
+const previewCanvas = ref<HTMLCanvasElement | null>(null)
 const imageSize = reactive({ width: 0, height: 0 })
 const stageSize = reactive({ width: 0, height: 0 })
 const selectedPoint = reactive<{ x: number | null; y: number | null }>({
@@ -54,6 +61,8 @@ const status = reactive<{ tone: StatusTone; message: string; recovery: string | 
   recovery: null,
 })
 let stageResizeObserver: ResizeObserver | null = null
+let previewDecoder: H264CanvasDecoder | null = null
+let previewFailurePending = false
 const adbSourceLabels: Record<AdbSource, string> = {
   bundled: '应用内置',
   saved: '上次使用',
@@ -73,11 +82,12 @@ const onlineDevices = computed(() =>
   appState.value.devices.filter((device) => device.status === 'online'),
 )
 const canCapture = computed(
-  () => Boolean(appState.value.selectedAdb && appState.value.activeDeviceSerial) && !busy.value,
+  () => Boolean(appState.value.selectedAdb && appState.value.activeDeviceSerial) && !appState.value.previewDeviceSerial && !busy.value,
 )
+const hasVisualFrame = computed(() => Boolean(screenshotUrl.value || appState.value.previewDeviceSerial))
 const hasSelectedPoint = computed(
   () =>
-    Boolean(screenshotUrl.value && appState.value.activeDeviceSerial) &&
+    Boolean(hasVisualFrame.value && appState.value.activeDeviceSerial) &&
     imageSize.width > 0 &&
     Number.isInteger(selectedPoint.x) &&
     Number.isInteger(selectedPoint.y) &&
@@ -153,10 +163,36 @@ function clearScreenshot() {
   selectedPoint.y = null
 }
 
+function closePreviewDecoder() {
+  previewDecoder?.close()
+  previewDecoder = null
+}
+
+async function recoverFromPreviewFailure(message: string) {
+  if (previewFailurePending) return
+  previewFailurePending = true
+  try {
+    applyState(await stopPreview())
+  } catch {
+    appState.value = { ...appState.value, previewDeviceSerial: null, lastFrame: null }
+  } finally {
+    closePreviewDecoder()
+    imageSize.width = 0
+    imageSize.height = 0
+    selectedPoint.x = null
+    selectedPoint.y = null
+    previewFailurePending = false
+    setStatus('error', message, '实时预览已停止，请继续使用“刷新截图”。')
+  }
+}
+
 function applyState(nextState: AppState) {
   const deviceChanged = appState.value.activeDeviceSerial !== nextState.activeDeviceSerial
   appState.value = nextState
-  if (deviceChanged) clearScreenshot()
+  if (deviceChanged) {
+    clearScreenshot()
+    closePreviewDecoder()
+  }
   if (nextState.lastEndpoint) {
     endpointHost.value = nextState.lastEndpoint.host
     endpointPort.value = String(nextState.lastEndpoint.port)
@@ -253,6 +289,44 @@ function handleCapture() {
   })
 }
 
+function handlePreviewChunk(chunk: Uint8Array) {
+  if (!previewCanvas.value) return
+  try {
+    previewDecoder ??= new H264CanvasDecoder(previewCanvas.value, (error) => {
+      void recoverFromPreviewFailure(`实时预览解码失败：${error.message}`)
+    })
+    previewDecoder.push(chunk)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '实时预览解码失败'
+    void recoverFromPreviewFailure(message)
+  }
+}
+
+function handlePreviewToggle() {
+  if (appState.value.previewDeviceSerial) {
+    void runOperation('preview', stopPreview, (state) => {
+      applyState(state)
+      closePreviewDecoder()
+      imageSize.width = 0
+      imageSize.height = 0
+      selectedPoint.x = null
+      selectedPoint.y = null
+      setStatus('neutral', '实时预览已停止，可继续使用静态截图。')
+    })
+    return
+  }
+  clearScreenshot()
+  imageSize.width = 1280
+  imageSize.height = 720
+  void runOperation('preview', () => startPreview(handlePreviewChunk, () => {
+    void recoverFromPreviewFailure('实时预览流已结束或超过 8 秒没有画面数据。')
+  }), (state) => {
+    applyState(state)
+    syncStageSize()
+    setStatus('success', '实时预览原型已启动；点击画面只会选择坐标。')
+  })
+}
+
 function handleImageLoad(event: Event) {
   const image = event.target as HTMLImageElement
   imageSize.width = image.naturalWidth
@@ -268,7 +342,7 @@ function syncStageSize() {
 }
 
 function handleStageClick(event: MouseEvent) {
-  if (!screenshotUrl.value || imageSize.width <= 0 || !screenshotStage.value) return
+  if (!hasVisualFrame.value || imageSize.width <= 0 || !screenshotStage.value) return
   const rect = screenshotStage.value.getBoundingClientRect()
   syncStageSize()
   const point = mapClientPointToImage(
@@ -304,6 +378,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stageResizeObserver?.disconnect()
   clearScreenshot()
+  closePreviewDecoder()
 })
 </script>
 
@@ -392,23 +467,36 @@ onBeforeUnmount(() => {
             <h2>设备画面</h2>
             <p>{{ appState.activeDeviceSerial || '选择设备后获取截图' }}</p>
           </div>
-          <button
-            data-testid="capture-button"
-            class="button primary"
-            type="button"
-            :disabled="!canCapture"
-            @click="handleCapture"
-          >
-            <Camera :size="18" aria-hidden="true" />
-            {{ busy === 'capture' ? '正在截图…' : '刷新截图' }}
-          </button>
+          <div class="frame-actions">
+            <button
+              data-testid="preview-button"
+              class="button secondary"
+              type="button"
+              :disabled="!appState.activeDeviceSerial || Boolean(busy)"
+              @click="handlePreviewToggle"
+            >
+              <Square v-if="appState.previewDeviceSerial" :size="16" aria-hidden="true" />
+              <Video v-else :size="18" aria-hidden="true" />
+              {{ busy === 'preview' ? '处理中…' : appState.previewDeviceSerial ? '停止预览' : '实时预览（原型）' }}
+            </button>
+            <button
+              data-testid="capture-button"
+              class="button primary"
+              type="button"
+              :disabled="!canCapture"
+              @click="handleCapture"
+            >
+              <Camera :size="18" aria-hidden="true" />
+              {{ busy === 'capture' ? '正在截图…' : '刷新截图' }}
+            </button>
+          </div>
         </div>
 
         <div
           ref="screenshotStage"
           data-testid="screenshot-stage"
           class="screenshot-stage"
-          :class="{ interactive: screenshotUrl && !busy }"
+          :class="{ interactive: hasVisualFrame && !busy }"
           @click="handleStageClick"
         >
           <img
@@ -418,7 +506,15 @@ onBeforeUnmount(() => {
             draggable="false"
             @load="handleImageLoad"
           />
-          <div v-else class="empty-state">
+          <canvas
+            ref="previewCanvas"
+            class="preview-canvas"
+            :class="{ visible: appState.previewDeviceSerial }"
+            width="1280"
+            height="720"
+            aria-label="活动设备实时预览"
+          />
+          <div v-if="!screenshotUrl && !appState.previewDeviceSerial" class="empty-state">
             <MonitorSmartphone :size="42" :stroke-width="1.4" aria-hidden="true" />
             <strong>尚无设备截图</strong>
             <span>选择在线设备，然后点击“刷新截图”。</span>
