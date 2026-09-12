@@ -15,6 +15,10 @@ export interface Size {
   height: number
 }
 
+export type ClickTarget =
+  | { kind: 'point'; x: number; y: number }
+  | { kind: 'rect'; left: number; top: number; width: number; height: number }
+
 export function calculateContainedImageRect(container: Rect, image: Size): Rect {
   if (container.width <= 0 || container.height <= 0 || image.width <= 0 || image.height <= 0) {
     return { left: container.left, top: container.top, width: 0, height: 0 }
@@ -58,5 +62,30 @@ export function mapClientPointToImage(
   return {
     x: Math.min(image.width - 1, Math.max(0, x)),
     y: Math.min(image.height - 1, Math.max(0, y)),
+  }
+}
+
+export function mapClientDragToImage(
+  start: Point,
+  end: Point,
+  container: Rect,
+  image: Size,
+  minimumDragPixels: number,
+): ClickTarget | null {
+  const endPoint = mapClientPointToImage(end, container, image)
+  if (!endPoint) return null
+  if (Math.hypot(end.x - start.x, end.y - start.y) < minimumDragPixels) {
+    return { kind: 'point', ...endPoint }
+  }
+  const startPoint = mapClientPointToImage(start, container, image)
+  if (!startPoint) return null
+  const left = Math.min(startPoint.x, endPoint.x)
+  const top = Math.min(startPoint.y, endPoint.y)
+  return {
+    kind: 'rect',
+    left,
+    top,
+    width: Math.abs(endPoint.x - startPoint.x),
+    height: Math.abs(endPoint.y - startPoint.y),
   }
 }

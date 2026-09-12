@@ -398,6 +398,15 @@ select:hover {
   translate: -50% -50%;
 }
 
+.selection-rect { position: absolute; z-index: 3; border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 20%, transparent); pointer-events: none; }
+.activity-panel { margin: 0 20px 20px; padding: 16px; }
+.activity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.activity-card { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
+.activity-card h3 { margin: 0 0 4px; font-size: 14px; }
+.activity-card label { color: var(--muted-foreground); font-size: 12px; font-weight: 650; }
+.activity-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.calibration-summary { margin: 4px 0 0; padding-left: 20px; color: var(--muted-foreground); font-size: 12px; line-height: 1.7; }
+
 .coordinate-marker::before {
   width: 42px;
   height: 2px;
@@ -475,6 +484,10 @@ select:hover {
   font-variant-numeric: tabular-nums;
 }
 
+.click-settings { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 12px; }
+.click-settings label { color: var(--muted-foreground); font-size: 11px; }
+.click-settings input { margin-top: 4px; width: 100%; }
+
 .tap-button {
   width: 100%;
   margin-top: 14px;
@@ -543,6 +556,7 @@ select:hover {
   .endpoint-field {
     grid-column: 1;
   }
+  .activity-grid { grid-template-columns: 1fr; }
 }
 
 @media (prefers-reduced-motion: reduce) {

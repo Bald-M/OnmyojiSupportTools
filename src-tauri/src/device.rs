@@ -19,15 +19,45 @@ use tokio::{
     time::timeout,
 };
 
+use crate::activity::{
+    ActivityConfig, ActivitySession, RecognitionResult, Rect as ActivityRect, TaskStatus,
+    VisualFeature, extract_feature, recognize, recognize_popup,
+};
+use crate::click::{ClickTarget, FrameBounds, Point, sample_target};
 use crate::preview::{
     AdbScreenrecordPreviewBackend, PreviewBackend, PreviewController, PreviewEndSink, PreviewSink,
 };
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const ADB_TIMEOUT: Duration = Duration::from_secs(8);
 const BUNDLED_ADB_SERVER_PORT: u16 = 5038;
 const BUNDLED_ADB_DISTRIBUTION_JSON: &str = include_str!("../adb-distribution.json");
 const MAX_ADB_SERVER_STATUS_BYTES: usize = 1024 * 1024;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+#[async_trait]
+trait ActivityRuntime: Send + Sync {
+    fn now(&self) -> tokio::time::Instant;
+    fn random_seed(&self) -> u64;
+    async fn sleep(&self, duration: Duration);
+}
+
+struct SystemActivityRuntime;
+
+#[async_trait]
+impl ActivityRuntime for SystemActivityRuntime {
+    fn now(&self) -> tokio::time::Instant {
+        tokio::time::Instant::now()
+    }
+
+    fn random_seed(&self) -> u64 {
+        rand::rng().random()
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,12 +117,6 @@ pub struct ConnectEndpoint {
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
-pub struct Point {
-    pub x: u32,
-    pub y: u32,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FrameSummary {
@@ -106,8 +130,50 @@ pub struct FrameSummary {
 #[serde(rename_all = "camelCase")]
 pub struct TapReceipt {
     pub device_serial: String,
-    pub point: Point,
+    pub target: ClickTarget,
+    pub delay_ms: u64,
+    pub final_point: Point,
+    pub press_duration_ms: u64,
     pub completed_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClickSettings {
+    pub delay_minimum_ms: u64,
+    pub delay_maximum_ms: u64,
+    pub point_radius: u32,
+    pub press_minimum_ms: u64,
+    pub press_maximum_ms: u64,
+}
+
+impl Default for ClickSettings {
+    fn default() -> Self {
+        Self {
+            delay_minimum_ms: if cfg!(test) { 0 } else { 300 },
+            delay_maximum_ms: if cfg!(test) { 0 } else { 900 },
+            point_radius: 6,
+            press_minimum_ms: 45,
+            press_maximum_ms: 120,
+        }
+    }
+}
+
+impl ClickSettings {
+    fn validate(self) -> Result<Self, AppError> {
+        if self.delay_minimum_ms > self.delay_maximum_ms
+            || self.point_radius == 0
+            || self.press_minimum_ms == 0
+            || self.press_minimum_ms > self.press_maximum_ms
+        {
+            return Err(AppError::new(
+                "CLICK_CONFIG_INVALID",
+                "随机点击配置范围无效",
+                "请检查延时、偏移半径和按压时长",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +186,9 @@ pub struct AppState {
     pub last_frame: Option<FrameSummary>,
     pub last_endpoint: Option<ConnectEndpoint>,
     pub preview_device_serial: Option<String>,
+    pub click_settings: ClickSettings,
+    pub activity_configs: Vec<ActivityConfig>,
+    pub activity_session: ActivitySession,
 }
 
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
@@ -240,6 +309,10 @@ struct StoredConfig {
     adb_path: Option<PathBuf>,
     active_device_serial: Option<String>,
     last_endpoint: Option<ConnectEndpoint>,
+    #[serde(default)]
+    click_settings: ClickSettings,
+    #[serde(default)]
+    activity_configs: Vec<ActivityConfig>,
 }
 
 #[derive(Deserialize)]
@@ -271,6 +344,27 @@ struct RuntimeState {
     active_device_serial: Option<String>,
     last_frame: Option<FrameSummary>,
     config: StoredConfig,
+    click_generation: u64,
+    last_click: Option<(String, Point)>,
+    last_frame_bytes: Option<Vec<u8>>,
+    activity_session: ActivitySession,
+    activity_deadline: Option<tokio::time::Instant>,
+    handled_popups: u8,
+}
+
+impl RuntimeState {
+    fn invalidate_device_context(&mut self, reason: &str) {
+        self.click_generation = self.click_generation.wrapping_add(1);
+        self.last_frame = None;
+        self.last_frame_bytes = None;
+        if !matches!(
+            self.activity_session.status,
+            TaskStatus::Idle | TaskStatus::Completed | TaskStatus::Failed
+        ) {
+            self.activity_session.pause(reason);
+            self.activity_deadline = None;
+        }
+    }
 }
 
 pub struct DeviceManager {
@@ -283,6 +377,7 @@ pub struct DeviceManager {
     server_probe: Arc<dyn AdbServerProbe>,
     state: RwLock<RuntimeState>,
     preview: PreviewController,
+    activity_runtime: Arc<dyn ActivityRuntime>,
 }
 
 impl DeviceManager {
@@ -367,7 +462,19 @@ impl DeviceManager {
             server_probe,
             state: RwLock::new(RuntimeState::default()),
             preview: PreviewController::new(preview_backend),
+            activity_runtime: Arc::new(SystemActivityRuntime),
         }
+    }
+
+    #[cfg(test)]
+    fn with_runner_and_activity_runtime(
+        config_path: PathBuf,
+        runner: Arc<dyn CommandRunner>,
+        activity_runtime: Arc<dyn ActivityRuntime>,
+    ) -> Self {
+        let mut manager = Self::with_runner(config_path, runner);
+        manager.activity_runtime = activity_runtime;
+        manager
     }
 
     #[cfg(test)]
@@ -415,6 +522,7 @@ impl DeviceManager {
 
         {
             let mut state = self.state.write().await;
+            state.invalidate_device_context("ADB 已切换");
             state.initialized = true;
             state.adb_candidates = candidates;
             state.selected_adb = selected_adb;
@@ -452,7 +560,6 @@ impl DeviceManager {
             state.selected_adb = Some(candidate);
             state.devices.clear();
             state.active_device_serial = None;
-            state.last_frame = None;
             state.config.adb_path = Some(path);
             state.config.active_device_serial = None;
             self.save_config(&state.config)?;
@@ -494,7 +601,7 @@ impl DeviceManager {
         }
 
         if active != state.active_device_serial {
-            state.last_frame = None;
+            state.invalidate_device_context("活动设备已失效或切换");
         }
         state.devices = devices;
         state.active_device_serial = active.clone();
@@ -550,7 +657,7 @@ impl DeviceManager {
         let mut state = self.state.write().await;
 
         if state.active_device_serial.as_deref() != Some(&serial) {
-            state.last_frame = None;
+            state.invalidate_device_context("活动设备已切换");
         }
         state.active_device_serial = Some(serial.clone());
         state.config.active_device_serial = Some(serial);
@@ -588,11 +695,16 @@ impl DeviceManager {
             device_serial: serial,
             captured_at: epoch_millis(),
         });
+        state.last_frame_bytes = Some(output.stdout.clone());
         Ok(output.stdout)
     }
 
-    pub async fn tap_screen(&self, point: Point) -> Result<TapReceipt, AppError> {
-        let (adb, serial, frame) = {
+    pub async fn tap_screen<T: Into<ClickTarget>>(
+        &self,
+        target: T,
+    ) -> Result<TapReceipt, AppError> {
+        let target = target.into();
+        let (adb, serial, frame, settings, generation, previous) = {
             let state = self.state.read().await;
             let adb = selected_path(&state)?;
             let serial = state.active_device_serial.clone().ok_or_else(|| {
@@ -609,21 +721,65 @@ impl DeviceManager {
                         "请先刷新截图并选择坐标",
                     )
                 })?;
-            (adb, serial, frame)
+            let previous = state
+                .last_click
+                .as_ref()
+                .filter(|(device, _)| device == &serial)
+                .map(|(_, point)| *point);
+            (
+                adb,
+                serial,
+                frame,
+                state.config.click_settings,
+                state.click_generation,
+                previous,
+            )
         };
-
-        if point.x >= frame.width || point.y >= frame.height {
-            return Err(AppError::new(
-                "POINT_OUT_OF_BOUNDS",
-                "坐标超出截图范围",
-                "请在截图内重新选择坐标",
-            ));
+        settings.validate()?;
+        let (delay_ms, press_duration_ms, final_point) = {
+            let mut rng = StdRng::seed_from_u64(self.activity_runtime.random_seed());
+            let delay = rng.random_range(settings.delay_minimum_ms..=settings.delay_maximum_ms);
+            let press = rng.random_range(settings.press_minimum_ms..=settings.press_maximum_ms);
+            let point = sample_target(
+                &target,
+                FrameBounds {
+                    width: frame.width,
+                    height: frame.height,
+                },
+                settings.point_radius,
+                previous,
+                &mut rng,
+            )?;
+            (delay, press, point)
+        };
+        self.activity_runtime
+            .sleep(Duration::from_millis(delay_ms))
+            .await;
+        {
+            let state = self.state.read().await;
+            let valid = state.click_generation == generation
+                && state.active_device_serial.as_deref() == Some(&serial)
+                && state.last_frame.as_ref().is_some_and(|current| {
+                    current.device_serial == serial && current.captured_at == frame.captured_at
+                });
+            if !valid {
+                return Err(AppError::new(
+                    "CLICK_CANCELLED",
+                    "待执行点击已取消",
+                    "设备、截图或点击配置已变化",
+                ));
+            }
         }
-
-        let x = point.x.to_string();
-        let y = point.y.to_string();
+        let x = final_point.x.to_string();
+        let y = final_point.y.to_string();
+        let duration = press_duration_ms.to_string();
         self.ensure_bundled_server(&adb).await?;
-        let args = self.adb_args(&adb, &["-s", &serial, "shell", "input", "tap", &x, &y]);
+        let args = self.adb_args(
+            &adb,
+            &[
+                "-s", &serial, "shell", "input", "swipe", &x, &y, &x, &y, &duration,
+            ],
+        );
         let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
         ensure_success(
             output.success,
@@ -634,11 +790,412 @@ impl DeviceManager {
             "请确认设备在线且允许 ADB 控制",
         )?;
 
+        self.state.write().await.last_click = Some((serial.clone(), final_point));
         Ok(TapReceipt {
             device_serial: serial,
-            point,
+            target,
+            delay_ms,
+            final_point,
+            press_duration_ms,
             completed_at: epoch_millis(),
         })
+    }
+
+    pub async fn set_click_settings(&self, settings: ClickSettings) -> Result<AppState, AppError> {
+        let settings = settings.validate()?;
+        let mut state = self.state.write().await;
+        state.config.click_settings = settings;
+        state.click_generation = state.click_generation.wrapping_add(1);
+        self.save_config(&state.config)?;
+        drop(state);
+        Ok(self.snapshot().await)
+    }
+
+    pub async fn cancel_pending_click(&self) {
+        let mut state = self.state.write().await;
+        state.click_generation = state.click_generation.wrapping_add(1);
+    }
+
+    pub async fn save_activity_config(
+        &self,
+        config: ActivityConfig,
+    ) -> Result<Vec<ActivityConfig>, AppError> {
+        config.validate()?;
+        let mut state = self.state.write().await;
+        let changed_active = state.activity_session.config_id == config.id
+            && state.activity_session.status != TaskStatus::Idle;
+        state
+            .config
+            .activity_configs
+            .retain(|item| item.id != config.id);
+        state.config.activity_configs.push(config);
+        if changed_active {
+            state.activity_session.pause("正在使用的活动配置已修改");
+            state.click_generation = state.click_generation.wrapping_add(1);
+        }
+        self.save_config(&state.config)?;
+        Ok(state.config.activity_configs.clone())
+    }
+
+    pub async fn delete_activity_config(&self, id: &str) -> Result<Vec<ActivityConfig>, AppError> {
+        let mut state = self.state.write().await;
+        if state.activity_session.config_id == id
+            && state.activity_session.status != TaskStatus::Idle
+        {
+            state.activity_session.pause("正在使用的活动配置已删除");
+            state.click_generation = state.click_generation.wrapping_add(1);
+        }
+        state.config.activity_configs.retain(|item| item.id != id);
+        self.save_config(&state.config)?;
+        Ok(state.config.activity_configs.clone())
+    }
+
+    pub async fn calibrate_activity_feature(
+        &self,
+        region: ActivityRect,
+    ) -> Result<VisualFeature, AppError> {
+        let state = self.state.read().await;
+        let bytes = state.last_frame_bytes.as_deref().ok_or_else(|| {
+            AppError::new(
+                "FRAME_REQUIRED",
+                "校准前需要当前设备截图",
+                "请刷新截图后再框选识别区域",
+            )
+        })?;
+        extract_feature(bytes, region)
+    }
+
+    pub async fn preview_activity_recognition(
+        &self,
+        config_id: &str,
+    ) -> Result<RecognitionResult, AppError> {
+        let state = self.state.read().await;
+        let config = state
+            .config
+            .activity_configs
+            .iter()
+            .find(|item| item.id == config_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    "ACTIVITY_CONFIG_NOT_FOUND",
+                    "活动配置不存在",
+                    "请选择或新建配置",
+                )
+            })?;
+        let bytes = state.last_frame_bytes.as_deref().ok_or_else(|| {
+            AppError::new("FRAME_REQUIRED", "识别前需要当前设备截图", "请刷新截图")
+        })?;
+        recognize(bytes, &config)
+    }
+
+    pub async fn start_activity(
+        &self,
+        config_id: String,
+        target_runs: u32,
+    ) -> Result<ActivitySession, AppError> {
+        let mut state = self.state.write().await;
+        let config = state
+            .config
+            .activity_configs
+            .iter()
+            .find(|item| item.id == config_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::new(
+                    "ACTIVITY_CONFIG_NOT_FOUND",
+                    "活动配置不存在",
+                    "请选择有效配置",
+                )
+            })?;
+        config.validate()?;
+        if state.active_device_serial.is_none() {
+            return Err(AppError::new(
+                "DEVICE_NOT_FOUND",
+                "尚未选择活动设备",
+                "请先选择在线设备",
+            ));
+        }
+        state.activity_session = ActivitySession::start(config_id, target_runs)?;
+        state.config.click_settings.delay_minimum_ms = config.click_delay.minimum_ms;
+        state.config.click_settings.delay_maximum_ms = config.click_delay.maximum_ms;
+        state.config.click_settings.press_minimum_ms = config.press_duration.minimum_ms;
+        state.config.click_settings.press_maximum_ms = config.press_duration.maximum_ms;
+        state.activity_deadline = Some(self.activity_runtime.now() + Duration::from_secs(60));
+        state.handled_popups = 0;
+        Ok(state.activity_session.clone())
+    }
+
+    pub async fn pause_activity(&self, reason: &str) -> ActivitySession {
+        self.cancel_pending_click().await;
+        let mut state = self.state.write().await;
+        state.activity_session.pause(reason);
+        state.activity_deadline = None;
+        state.activity_session.clone()
+    }
+
+    pub async fn stop_activity(&self) -> ActivitySession {
+        self.cancel_pending_click().await;
+        let mut state = self.state.write().await;
+        state.activity_session = ActivitySession::idle();
+        state.activity_deadline = None;
+        state.handled_popups = 0;
+        state.activity_session.clone()
+    }
+
+    pub async fn resume_activity(&self) -> Result<ActivitySession, AppError> {
+        let (config_id, mut resumed) = {
+            let state = self.state.read().await;
+            if state.activity_session.status != TaskStatus::Paused {
+                return Err(AppError::new(
+                    "ACTIVITY_RESUME_INVALID",
+                    "任务当前未暂停",
+                    "请刷新任务状态",
+                ));
+            }
+            (
+                state.activity_session.config_id.clone(),
+                state.activity_session.clone(),
+            )
+        };
+        let bytes = self.capture_screen().await?;
+        let config = {
+            let state = self.state.read().await;
+            state
+                .config
+                .activity_configs
+                .iter()
+                .find(|item| item.id == config_id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::new(
+                        "ACTIVITY_CONFIG_NOT_FOUND",
+                        "活动配置不存在",
+                        "无法恢复任务",
+                    )
+                })?
+        };
+        if recognize_popup(&bytes, &config)?.is_some() {
+            return Err(AppError::new(
+                "ACTIVITY_RESUME_INVALID",
+                "当前仍有已知弹窗，不能恢复",
+                "请保持暂停并检查页面",
+            ));
+        }
+        let result = recognize(&bytes, &config)?;
+        let page = result.matched_state.ok_or_else(|| {
+            AppError::new(
+                "ACTIVITY_RESUME_UNSAFE",
+                "当前页面无法唯一识别",
+                "请处理页面后重新识别",
+            )
+        })?;
+        resumed.status = TaskStatus::Navigating;
+        resumed.pause_reason = None;
+        if resumed.current_state != Some(page) {
+            resumed.observe(page)?;
+        }
+        let mut state = self.state.write().await;
+        if state.activity_session.status != TaskStatus::Paused
+            || state.activity_session.config_id != config_id
+        {
+            return Err(AppError::new(
+                "ACTIVITY_RESUME_STALE",
+                "任务在确认期间已经变化",
+                "请重新检查任务状态",
+            ));
+        }
+        state.activity_session = resumed;
+        state.activity_deadline = Some(self.activity_runtime.now() + Duration::from_secs(60));
+        Ok(state.activity_session.clone())
+    }
+
+    pub async fn advance_activity(&self) -> Result<ActivitySession, AppError> {
+        let (config_id, status) = {
+            let state = self.state.read().await;
+            (
+                state.activity_session.config_id.clone(),
+                state.activity_session.status,
+            )
+        };
+        if matches!(
+            status,
+            TaskStatus::Idle | TaskStatus::Paused | TaskStatus::Completed | TaskStatus::Failed
+        ) {
+            return Err(AppError::new(
+                "ACTIVITY_NOT_RUNNING",
+                "活动任务当前未运行",
+                "请开始任务或确认恢复",
+            ));
+        }
+        if self
+            .state
+            .read()
+            .await
+            .activity_deadline
+            .is_some_and(|deadline| self.activity_runtime.now() >= deadline)
+        {
+            return Ok(self.pause_activity("等待页面状态转换超时").await);
+        }
+        let bytes = match self.capture_screen().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let mut state = self.state.write().await;
+                state.activity_session.retry_count += 1;
+                if state.activity_session.retry_count >= 3 {
+                    state
+                        .activity_session
+                        .pause(format!("截图连续失败：{}", error.message));
+                }
+                let retry = state.activity_session.retry_count;
+                drop(state);
+                if retry < 3 {
+                    let mut rng = StdRng::seed_from_u64(self.activity_runtime.random_seed());
+                    let jitter = rng.random_range(0..=250);
+                    self.activity_runtime
+                        .sleep(Duration::from_millis((1u64 << (retry - 1)) * 1000 + jitter))
+                        .await;
+                }
+                let state = self.state.read().await;
+                return Ok(state.activity_session.clone());
+            }
+        };
+        let config = {
+            let state = self.state.read().await;
+            state
+                .config
+                .activity_configs
+                .iter()
+                .find(|item| item.id == config_id)
+                .cloned()
+                .ok_or_else(|| {
+                    AppError::new("ACTIVITY_CONFIG_NOT_FOUND", "活动配置不存在", "任务已暂停")
+                })?
+        };
+        if let Some(popup) = recognize_popup(&bytes, &config)? {
+            let (allowed, close) = {
+                let mut state = self.state.write().await;
+                state.handled_popups += 1;
+                (state.handled_popups <= 3, popup.close_action)
+            };
+            if !allowed {
+                return Ok(self.pause_activity("已知弹窗重复出现超过安全上限").await);
+            }
+            {
+                let mut state = self.state.write().await;
+                let delay = popup.click_delay.unwrap_or(config.click_delay);
+                let press = popup.press_duration.unwrap_or(config.press_duration);
+                state.config.click_settings.delay_minimum_ms = delay.minimum_ms;
+                state.config.click_settings.delay_maximum_ms = delay.maximum_ms;
+                state.config.click_settings.press_minimum_ms = press.minimum_ms;
+                state.config.click_settings.press_maximum_ms = press.maximum_ms;
+            }
+            if let Err(error) = self
+                .tap_screen(ClickTarget::Rect {
+                    left: close.left,
+                    top: close.top,
+                    width: close.width,
+                    height: close.height,
+                })
+                .await
+            {
+                return Ok(self
+                    .pause_activity(&format!("关闭已知弹窗失败：{}", error.message))
+                    .await);
+            }
+            return Ok(self.state.read().await.activity_session.clone());
+        }
+        let recognition = recognize(&bytes, &config)?;
+        let Some(page) = recognition.matched_state else {
+            return Ok(self
+                .pause_activity(
+                    recognition
+                        .reason
+                        .as_deref()
+                        .unwrap_or("无法唯一识别当前页面"),
+                )
+                .await);
+        };
+        let profile = config.states.iter().find(|profile| profile.state == page);
+        let action = profile.and_then(|profile| profile.action);
+        {
+            let mut state = self.state.write().await;
+            if state.activity_session.current_state != Some(page) {
+                if let Err(error) = state.activity_session.observe(page) {
+                    state.activity_session.pause(error.message);
+                }
+                state.handled_popups = 0;
+                state.activity_deadline = Some(
+                    self.activity_runtime.now()
+                        + Duration::from_secs(match page {
+                            crate::activity::PageState::Battling => 15 * 60,
+                            crate::activity::PageState::Reward => 90,
+                            _ => 60,
+                        }),
+                );
+            }
+            if matches!(
+                state.activity_session.status,
+                TaskStatus::Completed | TaskStatus::Paused
+            ) {
+                return Ok(state.activity_session.clone());
+            }
+            if state.activity_session.last_safe_action.as_deref() == Some(&format!("{:?}", page)) {
+                return Ok(state.activity_session.clone());
+            }
+        }
+        if page != crate::activity::PageState::Battling {
+            let Some(rect) = action else {
+                return Ok(self.pause_activity("当前页面缺少安全动作区域").await);
+            };
+            if let Some(profile) = profile {
+                let mut state = self.state.write().await;
+                let delay = profile.click_delay.unwrap_or(config.click_delay);
+                let press = profile.press_duration.unwrap_or(config.press_duration);
+                state.config.click_settings.delay_minimum_ms = delay.minimum_ms;
+                state.config.click_settings.delay_maximum_ms = delay.maximum_ms;
+                state.config.click_settings.press_minimum_ms = press.minimum_ms;
+                state.config.click_settings.press_maximum_ms = press.maximum_ms;
+            }
+            if let Err(error) = self
+                .tap_screen(ClickTarget::Rect {
+                    left: rect.left,
+                    top: rect.top,
+                    width: rect.width,
+                    height: rect.height,
+                })
+                .await
+            {
+                let mut state = self.state.write().await;
+                state.activity_session.retry_count += 1;
+                if state.activity_session.retry_count >= 3 {
+                    state
+                        .activity_session
+                        .pause(format!("安全动作连续失败：{}", error.message));
+                }
+                let retry = state.activity_session.retry_count;
+                drop(state);
+                if retry < 3 {
+                    let mut rng = StdRng::seed_from_u64(self.activity_runtime.random_seed());
+                    let jitter = rng.random_range(0..=250);
+                    self.activity_runtime
+                        .sleep(Duration::from_millis((1u64 << (retry - 1)) * 1000 + jitter))
+                        .await;
+                }
+                let state = self.state.read().await;
+                return Ok(state.activity_session.clone());
+            }
+            let mut state = self.state.write().await;
+            state.activity_session.retry_count = 0;
+            state.activity_session.last_safe_action = Some(format!("{:?}", page));
+            if matches!(
+                page,
+                crate::activity::PageState::Challenge | crate::activity::PageState::ReturnChallenge
+            ) {
+                state.activity_session.status = TaskStatus::Starting;
+            }
+        }
+        Ok(self.state.read().await.activity_session.clone())
     }
 
     pub async fn start_preview(
@@ -681,6 +1238,7 @@ impl DeviceManager {
         self.preview.stop().await;
         let mut state = self.state.write().await;
         state.last_frame = None;
+        state.last_frame_bytes = None;
         drop(state);
         Ok(self.snapshot().await)
     }
@@ -1038,6 +1596,9 @@ fn snapshot_from(state: &RuntimeState) -> AppState {
         last_frame: state.last_frame.clone(),
         last_endpoint: state.config.last_endpoint.clone(),
         preview_device_serial: None,
+        click_settings: state.config.click_settings,
+        activity_configs: state.config.activity_configs.clone(),
+        activity_session: state.activity_session.clone(),
     }
 }
 
@@ -1359,26 +1920,77 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use async_trait::async_trait;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+    use std::io::Cursor;
     use tokio::sync::Mutex;
 
     use super::{
-        AdbCandidate, AdbServerIdentity, AdbServerProbe, AdbServerStatusProto, AdbSource, AppError,
-        BundledAdbDistribution, BundledAdbFile, CommandOutput, CommandRunner, ConnectEndpoint,
-        DeviceManager, Point, ensure_bundled_server_port_available, ensure_success, parse_devices,
-        parse_endpoint, query_adb_server_identity, select_initial_adb, strings,
-        validate_bundled_adb_files, validate_png,
+        ActivityRuntime, AdbCandidate, AdbServerIdentity, AdbServerProbe, AdbServerStatusProto,
+        AdbSource, AppError, BundledAdbDistribution, BundledAdbFile, CommandOutput, CommandRunner,
+        ConnectEndpoint, DeviceManager, Point, ensure_bundled_server_port_available,
+        ensure_success, parse_devices, parse_endpoint, query_adb_server_identity,
+        select_initial_adb, strings, validate_bundled_adb_files, validate_png,
+    };
+    use crate::activity::{
+        ActivityConfig, FrameSpec, KnownPopup, Orientation, PageState, Rect, TaskStatus,
+        TimingRange, extract_feature,
     };
     use crate::preview::{PreviewBackend, PreviewEndSink, PreviewSessionHandle, PreviewSink};
 
     struct FakeRunner {
         outputs: Mutex<VecDeque<Result<CommandOutput, AppError>>>,
         calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    struct FakeActivityRuntime {
+        base: tokio::time::Instant,
+        elapsed_ms: AtomicU64,
+        seed: u64,
+        sleeps: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl FakeActivityRuntime {
+        fn new(seed: u64) -> Self {
+            Self {
+                base: tokio::time::Instant::now(),
+                elapsed_ms: AtomicU64::new(0),
+                seed,
+                sleeps: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn advance(&self, duration: Duration) {
+            self.elapsed_ms.fetch_add(
+                u64::try_from(duration.as_millis()).expect("test duration fits u64"),
+                Ordering::SeqCst,
+            );
+        }
+
+        fn sleeps(&self) -> Vec<Duration> {
+            self.sleeps.lock().expect("fake clock lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl ActivityRuntime for FakeActivityRuntime {
+        fn now(&self) -> tokio::time::Instant {
+            self.base + Duration::from_millis(self.elapsed_ms.load(Ordering::SeqCst))
+        }
+
+        fn random_seed(&self) -> u64 {
+            self.seed
+        }
+
+        async fn sleep(&self, duration: Duration) {
+            self.sleeps.lock().expect("fake clock lock").push(duration);
+            self.advance(duration);
+        }
     }
 
     struct FakePreviewBackend {
@@ -1500,6 +2112,56 @@ mod tests {
             stdout: stdout.to_vec(),
             stderr: Vec::new(),
         }
+    }
+
+    fn solid_png(color: [u8; 3]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16, 16, Rgb(color)));
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        bytes.into_inner()
+    }
+
+    fn activity_config(pages: &[(PageState, Vec<u8>)]) -> ActivityConfig {
+        let mut config = ActivityConfig::example_for_test();
+        config.frame = FrameSpec {
+            width: 16,
+            height: 16,
+            orientation: Orientation::Landscape,
+        };
+        config.click_delay = TimingRange {
+            minimum_ms: 0,
+            maximum_ms: 0,
+        };
+        config.press_duration = TimingRange {
+            minimum_ms: 1,
+            maximum_ms: 1,
+        };
+        for profile in &mut config.states {
+            let png = &pages
+                .iter()
+                .find(|(state, _)| *state == profile.state)
+                .unwrap()
+                .1;
+            profile.features = vec![
+                extract_feature(
+                    png,
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                )
+                .unwrap(),
+            ];
+            profile.action = (profile.state != PageState::Battling).then_some(Rect {
+                left: 1,
+                top: 1,
+                width: 14,
+                height: 14,
+            });
+        }
+        config
     }
 
     fn bundled_server_identity(adb_path: &Path) -> AdbServerIdentity {
@@ -2063,27 +2725,21 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
-            "POINT_OUT_OF_BOUNDS"
+            "CLICK_TARGET_INVALID"
         );
         let receipt = manager.tap_screen(Point { x: 1279, y: 719 }).await.unwrap();
         assert_eq!(receipt.device_serial, "emulator-5554");
-        assert_eq!(receipt.point.x, 1279);
+        assert!(receipt.final_point.x < 1280 && receipt.final_point.y < 720);
         assert_eq!(
             runner.calls().await[2],
             strings(&["-s", "emulator-5554", "exec-out", "screencap", "-p"])
         );
+        let calls = runner.calls().await;
         assert_eq!(
-            runner.calls().await[3],
-            strings(&[
-                "-s",
-                "emulator-5554",
-                "shell",
-                "input",
-                "tap",
-                "1279",
-                "719"
-            ])
+            &calls[3][..5],
+            strings(&["-s", "emulator-5554", "shell", "input", "swipe"])
         );
+        assert_eq!(calls[3].len(), 10);
     }
 
     #[tokio::test]
@@ -2141,6 +2797,673 @@ mod tests {
                 .unwrap_err()
                 .code,
             "DEVICE_CONNECT_FAILED"
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_flow_counts_only_the_settled_run_and_never_taps_during_battle() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let mut outputs = vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ];
+        for (state, png) in &pages {
+            outputs.push(success_bytes(png));
+            if *state != PageState::Battling && *state != PageState::ReturnChallenge {
+                outputs.push(success(""));
+            }
+        }
+        let runner = Arc::new(FakeRunner::with_outputs(outputs));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("config.json"), runner.clone());
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        for _ in 0..pages.len() {
+            manager.advance_activity().await.unwrap();
+        }
+
+        let session = manager.state.read().await.activity_session.clone();
+        assert_eq!(session.completed_runs, 1);
+        assert_eq!(session.status, TaskStatus::Completed);
+        let calls = runner.calls().await;
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_flow_completes_multiple_runs_and_never_counts_a_failed_partial_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let sequence = [
+            PageState::ActivityEntry,
+            PageState::StageEntry,
+            PageState::Challenge,
+            PageState::Battling,
+            PageState::Reward,
+            PageState::ReturnChallenge,
+            PageState::Battling,
+            PageState::Reward,
+            PageState::ReturnChallenge,
+        ];
+        let mut outputs = vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ];
+        let sequence_len = sequence.len();
+        for (index, state) in sequence.into_iter().enumerate() {
+            let png = &pages.iter().find(|(page, _)| *page == state).unwrap().1;
+            outputs.push(success_bytes(png));
+            if state != PageState::Battling
+                && !(state == PageState::ReturnChallenge && index + 1 == sequence_len)
+            {
+                outputs.push(success(""));
+            }
+        }
+        let runner = Arc::new(FakeRunner::with_outputs(outputs));
+        let manager = DeviceManager::with_runner(directory.path().join("config.json"), runner);
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 2).await.unwrap();
+
+        for index in 0..sequence_len {
+            let session = manager.advance_activity().await.unwrap();
+            if index < 5 {
+                assert_eq!(session.completed_runs, 0, "partial run must not count");
+            }
+        }
+
+        let session = manager.state.read().await.activity_session.clone();
+        assert_eq!(session.completed_runs, 2);
+        assert_eq!(session.status, TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn deterministic_runtime_recovers_after_two_transient_capture_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let runner = Arc::new(FakeRunner::with_results(vec![
+            Ok(success(
+                "Android Debug Bridge version 1.0.41\nVersion 35.0.2",
+            )),
+            Ok(success(
+                "List of devices attached\nemulator-5554 device model:MuMu_12\n",
+            )),
+            Err(AppError::new("CAPTURE_FAILED", "瞬时失败一", "重试")),
+            Err(AppError::new("CAPTURE_FAILED", "瞬时失败二", "重试")),
+            Ok(success_bytes(&pages[0].1)),
+            Ok(success("")),
+        ]));
+        let runtime = Arc::new(FakeActivityRuntime::new(7));
+        let manager = DeviceManager::with_runner_and_activity_runtime(
+            directory.path().join("config.json"),
+            runner.clone(),
+            runtime.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        assert_eq!(manager.advance_activity().await.unwrap().retry_count, 1);
+        assert_eq!(manager.advance_activity().await.unwrap().retry_count, 2);
+        let recovered = manager.advance_activity().await.unwrap();
+        assert_eq!(recovered.retry_count, 0);
+        assert_eq!(recovered.current_state, Some(PageState::ActivityEntry));
+        let sleeps = runtime.sleeps();
+        assert_eq!(sleeps.len(), 3); // two backoffs and the zero-delay safe action
+        assert!(sleeps[0] >= Duration::from_secs(1));
+        assert!(sleeps[0] < Duration::from_millis(1251));
+        assert!(sleeps[1] >= Duration::from_secs(2));
+        assert!(sleeps[1] < Duration::from_millis(2251));
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deterministic_runtime_recovers_after_two_transient_action_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let runner = Arc::new(FakeRunner::with_results(vec![
+            Ok(success(
+                "Android Debug Bridge version 1.0.41\nVersion 35.0.2",
+            )),
+            Ok(success(
+                "List of devices attached\nemulator-5554 device model:MuMu_12\n",
+            )),
+            Ok(success_bytes(&pages[0].1)),
+            Err(AppError::new("TAP_FAILED", "动作失败一", "重试")),
+            Ok(success_bytes(&pages[0].1)),
+            Err(AppError::new("TAP_FAILED", "动作失败二", "重试")),
+            Ok(success_bytes(&pages[0].1)),
+            Ok(success("")),
+        ]));
+        let runtime = Arc::new(FakeActivityRuntime::new(19));
+        let manager = DeviceManager::with_runner_and_activity_runtime(
+            directory.path().join("config.json"),
+            runner.clone(),
+            runtime.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        assert_eq!(manager.advance_activity().await.unwrap().retry_count, 1);
+        assert_eq!(manager.advance_activity().await.unwrap().retry_count, 2);
+        let recovered = manager.advance_activity().await.unwrap();
+        assert_eq!(recovered.retry_count, 0);
+        assert_eq!(recovered.last_safe_action.as_deref(), Some("ActivityEntry"));
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            3
+        );
+        assert_eq!(runtime.sleeps().len(), 5); // three click delays and two backoffs
+    }
+
+    #[tokio::test]
+    async fn resume_requires_a_fresh_uniquely_recognized_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&pages[0].1),
+        ]));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("resume.json"), runner.clone());
+        manager.set_adb_path(adb_path.clone()).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+        manager.pause_activity("用户暂停").await;
+        let resumed = manager.resume_activity().await.unwrap();
+        assert_eq!(resumed.status, TaskStatus::Navigating);
+        assert_eq!(resumed.current_state, Some(PageState::ActivityEntry));
+        assert_eq!(
+            runner.calls().await[2],
+            strings(&["-s", "emulator-5554", "exec-out", "screencap", "-p"])
+        );
+
+        let unknown = solid_png([60, 60, 60]);
+        let unsafe_runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&unknown),
+        ]));
+        let unsafe_manager =
+            DeviceManager::with_runner(directory.path().join("unsafe-resume.json"), unsafe_runner);
+        unsafe_manager.set_adb_path(adb_path).await.unwrap();
+        unsafe_manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        unsafe_manager
+            .start_activity("config".into(), 1)
+            .await
+            .unwrap();
+        unsafe_manager.pause_activity("用户暂停").await;
+        assert_eq!(
+            unsafe_manager.resume_activity().await.unwrap_err().code,
+            "ACTIVITY_RESUME_UNSAFE"
+        );
+        assert_eq!(
+            unsafe_manager.state.read().await.activity_session.status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_clock_expires_the_activity_deadline_without_waiting_or_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ]));
+        let runtime = Arc::new(FakeActivityRuntime::new(11));
+        let manager = DeviceManager::with_runner_and_activity_runtime(
+            directory.path().join("config.json"),
+            runner.clone(),
+            runtime.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+        runtime.advance(Duration::from_secs(61));
+
+        assert_eq!(
+            manager.advance_activity().await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(runner.calls().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn changing_the_active_activity_config_pauses_the_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ]));
+        let manager = DeviceManager::with_runner(directory.path().join("config.json"), runner);
+        manager.set_adb_path(adb_path).await.unwrap();
+        let colors = [
+            (PageState::ActivityEntry, [240, 10, 10]),
+            (PageState::StageEntry, [10, 240, 10]),
+            (PageState::Challenge, [10, 10, 240]),
+            (PageState::Battling, [240, 240, 10]),
+            (PageState::Reward, [240, 10, 240]),
+            (PageState::ReturnChallenge, [10, 240, 240]),
+        ];
+        let pages: Vec<_> = colors
+            .into_iter()
+            .map(|(state, color)| (state, solid_png(color)))
+            .collect();
+        let config = activity_config(&pages);
+        manager.save_activity_config(config.clone()).await.unwrap();
+        manager.start_activity("config".into(), 2).await.unwrap();
+        manager.save_activity_config(config).await.unwrap();
+        assert_eq!(
+            manager.state.read().await.activity_session.status,
+            TaskStatus::Paused
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_timeout_and_retry_exhaustion_pause_without_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let colors = [
+            (PageState::ActivityEntry, [240, 10, 10]),
+            (PageState::StageEntry, [10, 240, 10]),
+            (PageState::Challenge, [10, 10, 240]),
+            (PageState::Battling, [240, 240, 10]),
+            (PageState::Reward, [240, 10, 240]),
+            (PageState::ReturnChallenge, [10, 240, 240]),
+        ];
+        let pages: Vec<_> = colors
+            .into_iter()
+            .map(|(state, color)| (state, solid_png(color)))
+            .collect();
+        let timeout_runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ]));
+        let timeout_manager = DeviceManager::with_runner(
+            directory.path().join("timeout.json"),
+            timeout_runner.clone(),
+        );
+        timeout_manager
+            .set_adb_path(adb_path.clone())
+            .await
+            .unwrap();
+        timeout_manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        timeout_manager
+            .start_activity("config".into(), 1)
+            .await
+            .unwrap();
+        timeout_manager.state.write().await.activity_deadline = Some(tokio::time::Instant::now());
+        assert_eq!(
+            timeout_manager.advance_activity().await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(timeout_runner.calls().await.len(), 2);
+
+        let retry_runner = Arc::new(FakeRunner::with_results(vec![
+            Ok(success(
+                "Android Debug Bridge version 1.0.41\nVersion 35.0.2",
+            )),
+            Ok(success(
+                "List of devices attached\nemulator-5554 device model:MuMu_12\n",
+            )),
+            Err(AppError::new("CAPTURE_FAILED", "瞬时失败", "重试")),
+        ]));
+        let retry_manager =
+            DeviceManager::with_runner(directory.path().join("retry.json"), retry_runner.clone());
+        retry_manager.set_adb_path(adb_path).await.unwrap();
+        retry_manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        retry_manager
+            .start_activity("config".into(), 1)
+            .await
+            .unwrap();
+        retry_manager
+            .state
+            .write()
+            .await
+            .activity_session
+            .retry_count = 2;
+        assert_eq!(
+            retry_manager.advance_activity().await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            retry_runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_known_popup_is_closed_before_the_underlying_page_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let colors = [
+            (PageState::ActivityEntry, [240, 10, 10]),
+            (PageState::StageEntry, [10, 240, 10]),
+            (PageState::Challenge, [10, 10, 240]),
+            (PageState::Battling, [240, 240, 10]),
+            (PageState::Reward, [240, 10, 240]),
+            (PageState::ReturnChallenge, [10, 240, 240]),
+        ];
+        let pages: Vec<_> = colors
+            .into_iter()
+            .map(|(state, color)| (state, solid_png(color)))
+            .collect();
+        let popup_png = solid_png([120, 120, 120]);
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&popup_png),
+            success(""),
+        ]));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("config.json"), runner.clone());
+        manager.set_adb_path(adb_path).await.unwrap();
+        let mut config = activity_config(&pages);
+        config.known_popups.push(KnownPopup {
+            name: "popup".into(),
+            features: vec![
+                extract_feature(
+                    &popup_png,
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                )
+                .unwrap(),
+            ],
+            close_action: Rect {
+                left: 1,
+                top: 1,
+                width: 4,
+                height: 4,
+            },
+            click_delay: None,
+            press_duration: None,
+        });
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+        let session = manager.advance_activity().await.unwrap();
+        assert_eq!(session.current_state, None);
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_known_popup_pauses_at_the_limit_and_unknown_frame_never_taps() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let popup_png = solid_png([120, 120, 120]);
+        let unknown_png = solid_png([60, 60, 60]);
+        let mut outputs = vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ];
+        for _ in 0..3 {
+            outputs.push(success_bytes(&popup_png));
+            outputs.push(success(""));
+        }
+        outputs.push(success_bytes(&popup_png));
+        let runner = Arc::new(FakeRunner::with_outputs(outputs));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("popup.json"), runner.clone());
+        manager.set_adb_path(adb_path.clone()).await.unwrap();
+        let mut config = activity_config(&pages);
+        config.known_popups.push(KnownPopup {
+            name: "popup".into(),
+            features: vec![
+                extract_feature(
+                    &popup_png,
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        width: 16,
+                        height: 16,
+                    },
+                )
+                .unwrap(),
+            ],
+            close_action: Rect {
+                left: 1,
+                top: 1,
+                width: 4,
+                height: 4,
+            },
+            click_delay: None,
+            press_duration: None,
+        });
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+        for _ in 0..3 {
+            assert_ne!(
+                manager.advance_activity().await.unwrap().status,
+                TaskStatus::Paused
+            );
+        }
+        assert_eq!(
+            manager.advance_activity().await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            3
+        );
+
+        let unknown_runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&unknown_png),
+        ]));
+        let unknown_manager = DeviceManager::with_runner(
+            directory.path().join("unknown.json"),
+            unknown_runner.clone(),
+        );
+        unknown_manager.set_adb_path(adb_path).await.unwrap();
+        unknown_manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        unknown_manager
+            .start_activity("config".into(), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown_manager.advance_activity().await.unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            unknown_runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_session_and_device_change_send_no_activity_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::ReturnChallenge, solid_png([10, 240, 240])),
+        ];
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success(
+                "List of devices attached\nfirst device model:MuMu_12\nsecond device model:MuMu_12\n",
+            ),
+        ]));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("config.json"), runner.clone());
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.select_device("first".into()).await.unwrap();
+        manager
+            .save_activity_config(activity_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+        manager.pause_activity("用户暂停").await;
+        assert_eq!(
+            manager.advance_activity().await.unwrap_err().code,
+            "ACTIVITY_NOT_RUNNING"
+        );
+        manager.select_device("second".into()).await.unwrap();
+        assert_eq!(
+            manager.state.read().await.activity_session.status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            0
         );
     }
 }

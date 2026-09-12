@@ -1,9 +1,13 @@
+mod activity;
+mod click;
 mod device;
 mod preview;
 
 use std::path::PathBuf;
 
-use device::{AppError, AppState, ConnectEndpoint, DeviceManager, Point, TapReceipt};
+use activity::{ActivityConfig, ActivitySession, RecognitionResult, Rect, VisualFeature};
+use click::ClickTarget;
+use device::{AppError, AppState, ClickSettings, ConnectEndpoint, DeviceManager, TapReceipt};
 use std::sync::Arc;
 
 use tauri::{
@@ -52,10 +56,85 @@ async fn capture_screen(manager: State<'_, DeviceManager>) -> Result<Response, A
 
 #[tauri::command]
 async fn tap_screen(
-    point: Point,
+    target: ClickTarget,
     manager: State<'_, DeviceManager>,
 ) -> Result<TapReceipt, AppError> {
-    manager.tap_screen(point).await
+    manager.tap_screen(target).await
+}
+
+#[tauri::command]
+async fn set_click_settings(
+    settings: ClickSettings,
+    manager: State<'_, DeviceManager>,
+) -> Result<AppState, AppError> {
+    manager.set_click_settings(settings).await
+}
+
+#[tauri::command]
+async fn cancel_pending_click(manager: State<'_, DeviceManager>) -> Result<(), AppError> {
+    manager.cancel_pending_click().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_activity_config(
+    config: ActivityConfig,
+    manager: State<'_, DeviceManager>,
+) -> Result<Vec<ActivityConfig>, AppError> {
+    manager.save_activity_config(config).await
+}
+
+#[tauri::command]
+async fn delete_activity_config(
+    id: String,
+    manager: State<'_, DeviceManager>,
+) -> Result<Vec<ActivityConfig>, AppError> {
+    manager.delete_activity_config(&id).await
+}
+
+#[tauri::command]
+async fn calibrate_activity_feature(
+    region: Rect,
+    manager: State<'_, DeviceManager>,
+) -> Result<VisualFeature, AppError> {
+    manager.calibrate_activity_feature(region).await
+}
+
+#[tauri::command]
+async fn preview_activity_recognition(
+    config_id: String,
+    manager: State<'_, DeviceManager>,
+) -> Result<RecognitionResult, AppError> {
+    manager.preview_activity_recognition(&config_id).await
+}
+
+#[tauri::command]
+async fn start_activity(
+    config_id: String,
+    target_runs: u32,
+    manager: State<'_, DeviceManager>,
+) -> Result<ActivitySession, AppError> {
+    manager.start_activity(config_id, target_runs).await
+}
+
+#[tauri::command]
+async fn pause_activity(manager: State<'_, DeviceManager>) -> Result<ActivitySession, AppError> {
+    Ok(manager.pause_activity("用户暂停").await)
+}
+
+#[tauri::command]
+async fn resume_activity(manager: State<'_, DeviceManager>) -> Result<ActivitySession, AppError> {
+    manager.resume_activity().await
+}
+
+#[tauri::command]
+async fn stop_activity(manager: State<'_, DeviceManager>) -> Result<ActivitySession, AppError> {
+    Ok(manager.stop_activity().await)
+}
+
+#[tauri::command]
+async fn advance_activity(manager: State<'_, DeviceManager>) -> Result<ActivitySession, AppError> {
+    manager.advance_activity().await
 }
 
 #[tauri::command]
@@ -103,6 +182,17 @@ pub fn run() {
             select_device,
             capture_screen,
             tap_screen,
+            set_click_settings,
+            cancel_pending_click,
+            save_activity_config,
+            delete_activity_config,
+            calibrate_activity_feature,
+            preview_activity_recognition,
+            start_activity,
+            pause_activity,
+            resume_activity,
+            stop_activity,
+            advance_activity,
             start_preview,
             stop_preview
         ])

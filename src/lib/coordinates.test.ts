@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { calculateContainedImageRect, mapClientPointToImage } from './coordinates'
+import { calculateContainedImageRect, mapClientDragToImage, mapClientPointToImage } from './coordinates'
 
 describe('coordinate mapping', () => {
   it('maps a click through horizontal letterboxing', () => {
@@ -34,5 +34,22 @@ describe('coordinate mapping', () => {
       x: 1279,
       y: 719,
     })
+  })
+})
+
+describe('drag mapping', () => {
+  it.each([
+    [{ x: 250, y: 250 }, { x: 750, y: 500 }],
+    [{ x: 750, y: 500 }, { x: 250, y: 250 }],
+    [{ x: 750, y: 250 }, { x: 250, y: 500 }],
+    [{ x: 250, y: 500 }, { x: 750, y: 250 }],
+  ])('normalizes every drag direction through letterboxing', (start, end) => {
+    expect(mapClientDragToImage(start, end, { left: 0, top: 0, width: 1000, height: 750 }, { width: 1000, height: 500 }, 5)).toEqual({
+      kind: 'rect', left: 250, top: 125, width: 500, height: 250,
+    })
+  })
+
+  it('treats a short drag as a point', () => {
+    expect(mapClientDragToImage({ x: 500, y: 375 }, { x: 502, y: 378 }, { left: 0, top: 0, width: 1000, height: 750 }, { width: 1000, height: 500 }, 5)).toEqual({ kind: 'point', x: 502, y: 253 })
   })
 })
