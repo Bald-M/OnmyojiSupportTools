@@ -2619,7 +2619,7 @@ mod tests {
         manager.select_device("first".to_owned()).await.unwrap();
 
         let state = manager
-            .start_preview(Arc::new(|_| {}), Arc::new(|| {}))
+            .start_preview(Arc::new(|_| {}), Arc::new(|_| {}))
             .await
             .unwrap();
 
@@ -2676,7 +2676,7 @@ mod tests {
         manager.set_adb_path(adb_path).await.unwrap();
 
         manager
-            .start_preview(Arc::new(|_| {}), Arc::new(|| {}))
+            .start_preview(Arc::new(|_| {}), Arc::new(|_| {}))
             .await
             .unwrap();
         let stopped = manager.stop_preview().await.unwrap();
@@ -2685,7 +2685,7 @@ mod tests {
         assert_eq!(stop_count.load(Ordering::SeqCst), 1);
 
         let restarted = manager
-            .start_preview(Arc::new(|_| {}), Arc::new(|| {}))
+            .start_preview(Arc::new(|_| {}), Arc::new(|_| {}))
             .await
             .unwrap();
         assert_eq!(restarted.preview_device_serial.as_deref(), Some("first"));

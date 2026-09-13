@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use activity::{ActivityConfig, ActivitySession, RecognitionResult, Rect, VisualFeature};
 use click::ClickTarget;
 use device::{AppError, AppState, ClickSettings, ConnectEndpoint, DeviceManager, TapReceipt};
+use preview::PreviewEnd;
 use std::sync::Arc;
 
 use tauri::{
@@ -140,7 +141,7 @@ async fn advance_activity(manager: State<'_, DeviceManager>) -> Result<ActivityS
 #[tauri::command]
 async fn start_preview(
     on_chunk: Channel<InvokeResponseBody>,
-    on_ended: Channel<String>,
+    on_ended: Channel<PreviewEnd>,
     manager: State<'_, DeviceManager>,
 ) -> Result<AppState, AppError> {
     manager
@@ -148,8 +149,8 @@ async fn start_preview(
             Arc::new(move |bytes| {
                 let _ = on_chunk.send(InvokeResponseBody::Raw(bytes));
             }),
-            Arc::new(move || {
-                let _ = on_ended.send("ended".to_owned());
+            Arc::new(move |end| {
+                let _ = on_ended.send(end);
             }),
         )
         .await

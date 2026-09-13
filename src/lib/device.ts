@@ -2,6 +2,16 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 
 import type { ActivityConfig, ActivityRect, ActivitySession, AppState, ClickSettings, ClickTarget, ConnectEndpoint, RecognitionResult, TapReceipt, VisualFeature } from '@/types/device'
 
+export type PreviewEndCode = 'PREVIEW_STREAM_EOF' | 'PREVIEW_READ_FAILED' | 'PREVIEW_STREAM_STALLED' | 'PREVIEW_PROCESS_EXITED'
+
+export interface PreviewEnd {
+  code: PreviewEndCode
+  exitCode: number | null
+  firstChunkAt: number | null
+  lastChunkAt: number | null
+  stderr: string | null
+}
+
 export function getAppAppState(): Promise<AppState> {
   return invoke('get_app_app_state')
 }
@@ -45,10 +55,10 @@ export function advanceActivity(): Promise<ActivitySession> { return invoke('adv
 
 export function startPreview(
   onChunk: (chunk: Uint8Array) => void,
-  onEnded: () => void,
+  onEnded: (end: PreviewEnd) => void,
 ): Promise<AppState> {
   const channel = new Channel<ArrayBuffer>((payload) => onChunk(new Uint8Array(payload)))
-  const endedChannel = new Channel<string>(() => onEnded())
+  const endedChannel = new Channel<PreviewEnd>((end) => onEnded(end))
   return invoke('start_preview', { onChunk: channel, onEnded: endedChannel })
 }
 

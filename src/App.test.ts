@@ -226,9 +226,9 @@ describe('desktop device workflow', () => {
   })
 
   it('returns to static capture when the preview stream ends', async () => {
-    let endPreview = () => {}
+    let endPreview: (end: import('./lib/device').PreviewEnd) => void = () => {}
     device.startPreview.mockImplementationOnce(
-      (_onChunk: (chunk: Uint8Array) => void, onEnded: () => void) => {
+      (_onChunk: (chunk: Uint8Array) => void, onEnded: (end: import('./lib/device').PreviewEnd) => void) => {
         endPreview = onEnded
         return Promise.resolve({ ...readyState, previewDeviceSerial: readyState.activeDeviceSerial })
       },
@@ -238,12 +238,33 @@ describe('desktop device workflow', () => {
     await wrapper.get('[data-testid="preview-button"]').trigger('click')
     await flushPromises()
 
-    endPreview()
+    endPreview({ code: 'PREVIEW_STREAM_STALLED', exitCode: null, firstChunkAt: 1, lastChunkAt: 2, stderr: null })
     await flushPromises()
 
     expect(device.stopPreview).toHaveBeenCalledOnce()
     expect(wrapper.get('[data-testid="capture-button"]').attributes('disabled')).toBeUndefined()
     expect(wrapper.get('.status-bar').text()).toContain('刷新截图')
+    expect(wrapper.get('.status-bar').text()).toContain('连续 8 秒没有数据')
+  })
+
+  it('shows the preview process exit code and stderr', async () => {
+    let endPreview: (end: import('./lib/device').PreviewEnd) => void = () => {}
+    device.startPreview.mockImplementationOnce(
+      (_onChunk: (chunk: Uint8Array) => void, onEnded: (end: import('./lib/device').PreviewEnd) => void) => {
+        endPreview = onEnded
+        return Promise.resolve({ ...readyState, previewDeviceSerial: readyState.activeDeviceSerial })
+      },
+    )
+    const wrapper = mount(App)
+    await flushPromises()
+    await wrapper.get('[data-testid="preview-button"]').trigger('click')
+    await flushPromises()
+
+    endPreview({ code: 'PREVIEW_PROCESS_EXITED', exitCode: 1, firstChunkAt: 1, lastChunkAt: 2, stderr: 'encoder failed' })
+    await flushPromises()
+
+    expect(wrapper.get('.status-bar').text()).toContain('退出码 1')
+    expect(wrapper.get('.status-bar').text()).toContain('encoder failed')
   })
 
   it('starts a saved activity and requires recognition before resume confirmation', async () => {

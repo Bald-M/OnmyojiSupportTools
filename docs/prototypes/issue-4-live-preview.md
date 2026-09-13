@@ -36,6 +36,6 @@ Windows x64 的 WebView2 能否持续低延迟解码并显示 MuMu 12 经当前�
 
 - WebCodecs 与 H.264 hardware acceleration 的实际可用性取决于目标 WebView2 Runtime、GPU 驱动与系统媒体组件。
 - 原型使用固定编码尺寸，尚未从码流 SPS 提取旋转后的显示尺寸；方向变化验收未完成。
-- `screenrecord` 自然退出、读取失败或码流停滞会触发统一的结束事件并自动回退；目前尚未区分具体退出原因。
+- `screenrecord` 自然退出、非零退出、读取失败或连续 8 秒码流停滞会触发带稳定原因码、退出码、首末数据时间和截断 stderr 的结束事件并自动回退；仍需在目标设备记录诊断结果以判断兼容性。
 - Tauri Channel 保序传输原始码流块；只有解码队列积压后才在 access-unit 边界丢帧，Windows 实测需确认 IPC 不会成为延迟瓶颈。
 - 未引入、复制或打包 scrcpy 代码与产物，因此当前无需新增第三方许可证；正式采集方案必须另行 ADR 决策。

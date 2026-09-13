@@ -36,6 +36,7 @@ import {
   stopActivity,
   setClickSettings,
   deleteActivityConfig,
+  type PreviewEnd,
 } from './lib/device'
 import { H264CanvasDecoder } from './lib/h264'
 import type { ActivityConfig, AdbSource, AppError, AppState, ClickTarget, DeviceStatus, PageState, RecognitionResult } from './types/device'
@@ -505,6 +506,16 @@ function handlePreviewChunk(chunk: Uint8Array) {
   }
 }
 
+function previewEndMessage(end: PreviewEnd): string {
+  const detail = end.stderr ? `：${end.stderr}` : ''
+  switch (end.code) {
+    case 'PREVIEW_STREAM_STALLED': return '实时预览码流已连续 8 秒没有数据。'
+    case 'PREVIEW_READ_FAILED': return `读取实时预览码流失败${detail}`
+    case 'PREVIEW_PROCESS_EXITED': return `实时预览进程异常退出${end.exitCode === null ? '' : `（退出码 ${end.exitCode}）`}${detail}`
+    case 'PREVIEW_STREAM_EOF': return `实时预览码流已结束${detail}`
+  }
+}
+
 function handlePreviewToggle() {
   if (appState.value.previewDeviceSerial) {
     void runOperation('preview', stopPreview, (state) => {
@@ -522,8 +533,8 @@ function handlePreviewToggle() {
   clearScreenshot()
   imageSize.width = 1280
   imageSize.height = 720
-  void runOperation('preview', () => startPreview(handlePreviewChunk, () => {
-    void recoverFromPreviewFailure('实时预览流已结束或超过 8 秒没有画面数据。')
+  void runOperation('preview', () => startPreview(handlePreviewChunk, (end) => {
+    void recoverFromPreviewFailure(previewEndMessage(end))
   }), (state) => {
     applyState(state)
     syncStageSize()
