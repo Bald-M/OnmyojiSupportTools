@@ -295,7 +295,7 @@ select:hover {
 
 .screenshot-panel {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto auto minmax(0, 1fr);
 }
 
 .panel-header {
@@ -398,7 +398,26 @@ select:hover {
   translate: -50% -50%;
 }
 
-.selection-rect { position: absolute; z-index: 3; border: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 20%, transparent); pointer-events: none; }
+.selection-rect { position: absolute; z-index: 3; border: 1px solid white; outline: 1px solid black; background: color-mix(in srgb, var(--accent) 15%, transparent); cursor: move; }
+.selection-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px; }
+.selection-tools span { font-size: 12px; }
+.selection-tools [aria-pressed="true"] { outline: 2px solid var(--accent); }
+.screenshot-stage { touch-action: none; user-select: none; }
+.selection-controls { position: absolute; z-index: 4; pointer-events: none; }
+.selection-move { position: absolute; left: 50%; top: 50%; translate: -50% -50%; display: grid; place-items: center; width: 24px; height: 24px; background: black; color: white; border: 1px solid white; cursor: move; pointer-events: auto; }
+.selection-handle { pointer-events: auto; position: absolute; width: 24px; height: 24px; translate: -50% -50%; z-index: 2; }
+.selection-handle::after { content: ""; position: absolute; inset: 8px; background: white; border: 1px solid black; box-shadow: 0 0 0 1px white; }
+.handle-n, .handle-ne, .handle-nw { top: 12px; }
+.handle-s, .handle-se, .handle-sw { top: calc(100% - 12px); }
+.handle-e, .handle-w { top: 50%; }
+.handle-w, .handle-nw, .handle-sw { left: 12px; }
+.handle-e, .handle-ne, .handle-se { left: calc(100% - 12px); }
+.handle-n, .handle-s { left: 50%; cursor: ns-resize; }
+.handle-e, .handle-w { cursor: ew-resize; }
+.handle-ne, .handle-sw { cursor: nesw-resize; }
+.handle-nw, .handle-se { cursor: nwse-resize; }
+.selection-label { position: absolute; top: 0; left: 0; padding: 2px 4px; background: black; color: white; font-size: 12px; pointer-events: none; white-space: nowrap; }
+
 .activity-panel { margin: 0 20px 20px; padding: 16px; }
 .activity-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .activity-card { display: grid; gap: 8px; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-muted); }
@@ -569,3 +588,5 @@ select:hover {
     animation-iteration-count: 1 !important;
   }
 }
+
+.target-editor { min-height: 180px; }

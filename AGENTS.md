@@ -22,3 +22,13 @@
 ## Completion checks
 
 Keep changes narrow and test observable behavior. Run `pnpm check` and `pnpm frontend:build`; run `pnpm build:windows:x64` on Windows. Build artifact names must contain version, platform, and architecture. Update user documentation and `CHANGELOG.md` when behavior changes.
+
+## Agent skills
+
+### Issue tracker
+
+Use GitHub Issues for tickets and specs; read `docs/agents/issue-tracker.md` before tracker operations.
+
+### Domain docs
+
+Single-context layout; read `docs/agents/domain.md` when exploring project terms or architectural decisions.

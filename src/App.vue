@@ -10,11 +10,12 @@ import {
   RefreshCw,
   Video,
   Square,
+  Move,
 } from '@lucide/vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 
-import { calculateContainedImageRect, mapClientDragToImage, mapClientPointToImage } from './lib/coordinates'
+import { calculateContainedImageRect, mapClientPointToImage } from './lib/coordinates'
 import {
   captureScreen,
   connectDevice,
@@ -69,7 +70,11 @@ const selectedPoint = reactive<{ x: number | null; y: number | null }>({
   y: null,
 })
 const selectedTarget = ref<ClickTarget | null>(null)
-let dragStart: { x: number; y: number } | null = null
+type ResizeHandle = 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w' | 'nw'
+const resizeHandles: ResizeHandle[] = ['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw']
+const selectionMode = ref<'point' | 'rect'>('point')
+let edit: { pointerId: number; start: { x: number; y: number }; original: Extract<ClickTarget, { kind: 'rect' }> | null; handle: ResizeHandle | 'move' | 'create'; clientStart: { x: number; y: number } } | null = null
+let suppressStageClick = false
 const endpointHost = ref('127.0.0.1')
 const endpointPort = ref('')
 const status = reactive<{ tone: StatusTone; message: string; recovery: string | null }>({
@@ -152,6 +157,17 @@ const selectionStyle = computed(() => {
   return { left: `${fitted.left + target.left / imageSize.width * fitted.width}px`, top: `${fitted.top + target.top / imageSize.height * fitted.height}px`, width: `${target.width / imageSize.width * fitted.width}px`, height: `${target.height / imageSize.height * fitted.height}px` }
 })
 
+const selectionControlsStyle = computed(() => {
+  if (selectedTarget.value?.kind !== 'rect' || !stageSize.width || !stageSize.height) return { display: 'none' }
+  const fitted = calculateContainedImageRect({ left: 0, top: 0, width: stageSize.width, height: stageSize.height }, imageSize)
+  const target = selectedTarget.value
+  const width = Math.min(stageSize.width, Math.max(96, target.width / imageSize.width * fitted.width))
+  const height = Math.min(stageSize.height, Math.max(96, target.height / imageSize.height * fitted.height))
+  const left = Math.max(0, Math.min(stageSize.width - width, fitted.left + (target.left + target.width / 2) / imageSize.width * fitted.width - width / 2))
+  const top = Math.max(0, Math.min(stageSize.height - height, fitted.top + (target.top + target.height / 2) / imageSize.height * fitted.height - height / 2))
+  return { left: `${left}px`, top: `${top}px`, width: `${width}px`, height: `${height}px` }
+})
+
 function setStatus(tone: StatusTone, message: string, recovery: string | null = null) {
   status.tone = tone
   status.message = message
@@ -192,6 +208,7 @@ async function runOperation<T>(
 }
 
 function clearScreenshot() {
+  endSelectionEdit()
   if (screenshotUrl.value) {
     URL.revokeObjectURL(screenshotUrl.value)
   }
@@ -221,20 +238,22 @@ function selectedRect() {
 }
 
 function createRectFromPoint() {
+  endSelectionEdit()
   if (!imageSize.width || !imageSize.height) return
-  const x = Number.isInteger(selectedPoint.x) ? Number(selectedPoint.x) : 0
-  const y = Number.isInteger(selectedPoint.y) ? Number(selectedPoint.y) : 0
+  const x = Math.max(0, Math.min(imageSize.width - 1, Number.isInteger(selectedPoint.x) ? Number(selectedPoint.x) : 0))
+  const y = Math.max(0, Math.min(imageSize.height - 1, Number.isInteger(selectedPoint.y) ? Number(selectedPoint.y) : 0))
   selectedTarget.value = { kind: 'rect', left: x, top: y, width: Math.min(40, imageSize.width - x), height: Math.min(40, imageSize.height - y) }
   selectedPoint.x = null; selectedPoint.y = null
 }
 
 function normalizeKeyboardRect() {
+  endSelectionEdit()
   const target = selectedTarget.value
   if (target?.kind !== 'rect') return
-  target.left = Math.max(0, Math.min(Math.trunc(target.left), imageSize.width - 1))
-  target.top = Math.max(0, Math.min(Math.trunc(target.top), imageSize.height - 1))
-  target.width = Math.max(1, Math.min(Math.trunc(target.width), imageSize.width - target.left))
-  target.height = Math.max(1, Math.min(Math.trunc(target.height), imageSize.height - target.top))
+  target.left = Math.max(0, Math.min(Math.trunc(Number(target.left) || 0), imageSize.width - 1))
+  target.top = Math.max(0, Math.min(Math.trunc(Number(target.top) || 0), imageSize.height - 1))
+  target.width = Math.max(1, Math.min(Math.trunc(Number(target.width) || 1), imageSize.width - target.left))
+  target.height = Math.max(1, Math.min(Math.trunc(Number(target.height) || 1), imageSize.height - target.top))
 }
 
 function addCalibrationFeature() {
@@ -380,11 +399,7 @@ async function recoverFromPreviewFailure(message: string) {
     appState.value = { ...appState.value, previewDeviceSerial: null, lastFrame: null }
   } finally {
     closePreviewDecoder()
-    imageSize.width = 0
-    imageSize.height = 0
-    selectedPoint.x = null
-    selectedPoint.y = null
-    selectedTarget.value = null
+    clearScreenshot()
     previewFailurePending = false
     setStatus('error', message, '实时预览已停止，请继续使用“刷新截图”。')
   }
@@ -392,8 +407,10 @@ async function recoverFromPreviewFailure(message: string) {
 
 function applyState(nextState: AppState) {
   const deviceChanged = appState.value.activeDeviceSerial !== nextState.activeDeviceSerial
+  const adbChanged = appState.value.selectedAdb?.path !== nextState.selectedAdb?.path
+  const previewStopped = Boolean(appState.value.previewDeviceSerial && !nextState.previewDeviceSerial)
   appState.value = nextState
-  if (deviceChanged) {
+  if (deviceChanged || adbChanged || previewStopped) {
     clearScreenshot()
     closePreviewDecoder()
   }
@@ -521,11 +538,7 @@ function handlePreviewToggle() {
     void runOperation('preview', stopPreview, (state) => {
       applyState(state)
       closePreviewDecoder()
-      imageSize.width = 0
-      imageSize.height = 0
-      selectedPoint.x = null
-      selectedPoint.y = null
-      selectedTarget.value = null
+      clearScreenshot()
       setStatus('neutral', '实时预览已停止，可继续使用静态截图。')
     })
     return
@@ -556,34 +569,89 @@ function syncStageSize() {
   stageSize.height = rect.height
 }
 
-function handleStageClick(event: MouseEvent) {
-  if (!hasVisualFrame.value || imageSize.width <= 0 || !screenshotStage.value) return
-  const rect = screenshotStage.value.getBoundingClientRect()
-  syncStageSize()
-  const point = mapClientPointToImage(
-    { x: event.clientX, y: event.clientY },
-    { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
-    imageSize,
-  )
+function selectPoint(event: MouseEvent) {
+  if (!hasVisualFrame.value || busy.value || !screenshotStage.value) return
+  const point = mapClientPointToImage({ x: event.clientX, y: event.clientY }, screenshotStage.value.getBoundingClientRect(), imageSize)
   if (!point) return
   selectedPoint.x = point.x
   selectedPoint.y = point.y
   selectedTarget.value = { kind: 'point', ...point }
-  setStatus('neutral', `已选择坐标 (${point.x}, ${point.y})，等待执行。`)
+  syncStageSize()
 }
 
-function handleStageMouseDown(event: MouseEvent) { dragStart = { x: event.clientX, y: event.clientY } }
+function handleStageClick(event: MouseEvent) {
+  if (suppressStageClick) { suppressStageClick = false; return }
+  if (selectionMode.value === 'point' && selectedTarget.value?.kind !== 'rect') selectPoint(event)
+}
 
-function handleStageMouseUp(event: MouseEvent) {
-  if (!dragStart || !screenshotStage.value || !hasVisualFrame.value) return
-  const rect = screenshotStage.value.getBoundingClientRect()
-  const target = mapClientDragToImage(dragStart, { x: event.clientX, y: event.clientY }, rect, imageSize, 5)
-  dragStart = null
-  if (!target || target.kind !== 'rect') return
-  selectedTarget.value = target
-  selectedPoint.x = null
-  selectedPoint.y = null
-  setStatus('neutral', `已选择区域 ${target.width} × ${target.height}，等待执行。`)
+function endSelectionEdit() {
+  const pointerId = edit?.pointerId
+  edit = null
+  if (pointerId !== undefined && screenshotStage.value?.hasPointerCapture?.(pointerId)) screenshotStage.value.releasePointerCapture(pointerId)
+}
+
+function handleStagePointerDown(event: PointerEvent) {
+  if (event.button !== 0 || busy.value || edit || !hasVisualFrame.value || !screenshotStage.value || !imageSize.width) return
+  const container = screenshotStage.value.getBoundingClientRect()
+  const targetElement = event.target as HTMLElement
+  const handle = targetElement.closest<HTMLElement>('[data-resize-handle]')?.dataset.resizeHandle as ResizeHandle | undefined
+  const moving = Boolean(targetElement.closest('.selection-rect, [data-selection-move]'))
+  if (!mapClientPointToImage({ x: event.clientX, y: event.clientY }, container, imageSize) && !handle) return
+  const fitted = calculateContainedImageRect(container, imageSize)
+  const start = { x: (event.clientX - fitted.left) / fitted.width * imageSize.width, y: (event.clientY - fitted.top) / fitted.height * imageSize.height }
+  const original = selectedTarget.value?.kind === 'rect' ? { ...selectedTarget.value } : null
+  edit = { pointerId: event.pointerId, start, original, handle: handle ?? (moving && original ? 'move' : 'create'), clientStart: { x: event.clientX, y: event.clientY } }
+  suppressStageClick = false
+  screenshotStage.value.setPointerCapture?.(event.pointerId)
+  event.preventDefault()
+  if (selectionMode.value === 'rect' && edit.handle === 'create') handleStagePointerMove(event)
+}
+
+function handleStagePointerMove(event: PointerEvent) {
+  if (!edit || edit.pointerId !== event.pointerId || busy.value || !screenshotStage.value) return
+  const fitted = calculateContainedImageRect(screenshotStage.value.getBoundingClientRect(), imageSize)
+  if (!fitted.width || !fitted.height) return
+  const x = (event.clientX - fitted.left) / fitted.width * imageSize.width
+  const y = (event.clientY - fitted.top) / fitted.height * imageSize.height
+  const clamp = (value: number, maximum: number) => Math.max(0, Math.min(value, maximum))
+  const original = edit.original
+  let left: number, top: number, right: number, bottom: number
+  if (original && edit.handle === 'move') {
+    left = clamp(original.left + Math.round(x - edit.start.x), imageSize.width - original.width)
+    top = clamp(original.top + Math.round(y - edit.start.y), imageSize.height - original.height)
+    right = left + original.width; bottom = top + original.height
+  } else if (original && edit.handle !== 'create') {
+    left = original.left; top = original.top; right = left + original.width; bottom = top + original.height
+    if (edit.handle.includes('w')) left = clamp(original.left + Math.round(x - edit.start.x), right - 1)
+    if (edit.handle.includes('e')) right = Math.max(left + 1, clamp(original.left + original.width + Math.round(x - edit.start.x), imageSize.width))
+    if (edit.handle.includes('n')) top = clamp(original.top + Math.round(y - edit.start.y), bottom - 1)
+    if (edit.handle.includes('s')) bottom = Math.max(top + 1, clamp(original.top + original.height + Math.round(y - edit.start.y), imageSize.height))
+  } else {
+    if (selectionMode.value === 'point' && Math.hypot(event.clientX - edit.clientStart.x, event.clientY - edit.clientStart.y) < 5) return
+    const startX = clamp(Math.round(edit.start.x), imageSize.width)
+    const startY = clamp(Math.round(edit.start.y), imageSize.height)
+    left = Math.min(startX, clamp(Math.round(x), imageSize.width)); top = Math.min(startY, clamp(Math.round(y), imageSize.height))
+    right = Math.max(startX, clamp(Math.round(x), imageSize.width)); bottom = Math.max(startY, clamp(Math.round(y), imageSize.height))
+    left = Math.min(left, imageSize.width - 1); top = Math.min(top, imageSize.height - 1)
+    right = Math.max(right, left + 1); bottom = Math.max(bottom, top + 1)
+  }
+  selectedTarget.value = { kind: 'rect', left, top, width: right - left, height: bottom - top }
+  selectedPoint.x = null; selectedPoint.y = null
+  syncStageSize()
+}
+
+function handleStagePointerUp(event: PointerEvent) {
+  if (!edit || edit.pointerId !== event.pointerId) return
+  handleStagePointerMove(event)
+  if (edit.handle === 'create' && selectionMode.value === 'point' && Math.hypot(event.clientX - edit.clientStart.x, event.clientY - edit.clientStart.y) < 5) selectPoint(event)
+  suppressStageClick = true
+  endSelectionEdit()
+}
+
+function changeSelectionMode(mode: 'point' | 'rect') {
+  endSelectionEdit()
+  selectionMode.value = mode
+  if (mode === 'point') { selectedTarget.value = null; selectedPoint.x = null; selectedPoint.y = null }
 }
 
 function handleTap() {
@@ -743,14 +811,22 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
+        <div class="selection-tools" aria-label="选区编辑模式">
+          <button class="button secondary" type="button" :aria-pressed="selectionMode === 'point'" :disabled="!hasVisualFrame || Boolean(busy)" @click="changeSelectionMode('point')">选择单点</button>
+          <button class="button secondary" type="button" :aria-pressed="selectionMode === 'rect'" :disabled="!hasVisualFrame || Boolean(busy)" @click="changeSelectionMode('rect')">创建区域</button>
+          <span>拖动画面框选；拖动区域或中心十字移动，边角手柄缩放。小选区手柄在外围。</span>
+        </div>
         <div
           ref="screenshotStage"
           data-testid="screenshot-stage"
           class="screenshot-stage"
           :class="{ interactive: hasVisualFrame && !busy }"
           @click="handleStageClick"
-          @mousedown="handleStageMouseDown"
-          @mouseup="handleStageMouseUp"
+          @pointerdown="handleStagePointerDown"
+          @pointermove="handleStagePointerMove"
+          @pointerup="handleStagePointerUp"
+          @pointercancel="endSelectionEdit"
+          @lostpointercapture="endSelectionEdit"
         >
           <img
             v-if="screenshotUrl"
@@ -773,7 +849,13 @@ onBeforeUnmount(() => {
             <span>选择在线设备，然后点击“刷新截图”。</span>
           </div>
           <span class="coordinate-marker" :style="markerStyle" aria-hidden="true" />
-          <span class="selection-rect" :style="selectionStyle" aria-hidden="true" />
+          <span v-if="selectedTarget?.kind === 'rect'" class="selection-rect" :style="selectionStyle" aria-hidden="true">
+            <span class="selection-label">{{ selectedTarget.width }} × {{ selectedTarget.height }} px</span>
+          </span>
+          <span v-if="selectedTarget?.kind === 'rect'" class="selection-controls" :style="selectionControlsStyle" aria-hidden="true">
+            <span v-for="handle in resizeHandles" :key="handle" class="selection-handle" :class="`handle-${handle}`" :data-resize-handle="handle" />
+            <span class="selection-move" data-selection-move title="移动区域"><Move :size="14" /></span>
+          </span>
         </div>
       </article>
 
@@ -810,7 +892,7 @@ onBeforeUnmount(() => {
               type="number"
               min="0"
               :max="Math.max(0, imageSize.width - 1)"
-              :disabled="!imageSize.width || Boolean(busy)"
+              :disabled="!imageSize.width || Boolean(busy) || selectedTarget?.kind === 'rect'"
             />
           </div>
           <div>
@@ -821,17 +903,19 @@ onBeforeUnmount(() => {
               type="number"
               min="0"
               :max="Math.max(0, imageSize.height - 1)"
-              :disabled="!imageSize.height || Boolean(busy)"
+              :disabled="!imageSize.height || Boolean(busy) || selectedTarget?.kind === 'rect'"
             />
           </div>
         </div>
-        <p v-if="selectedTarget?.kind === 'rect'" data-testid="selection-size" class="safety-note">点击区域：{{ selectedTarget.width }} × {{ selectedTarget.height }} px</p>
-        <button v-if="hasVisualFrame && selectedTarget?.kind !== 'rect'" class="button secondary tap-button" type="button" :disabled="Boolean(busy)" @click="createRectFromPoint">从当前点创建可编辑区域</button>
-        <div v-if="selectedTarget?.kind === 'rect'" class="click-settings" aria-label="点击区域像素边界">
-          <label>Left<input v-model.number="selectedTarget.left" type="number" min="0" @change="normalizeKeyboardRect" /></label>
-          <label>Top<input v-model.number="selectedTarget.top" type="number" min="0" @change="normalizeKeyboardRect" /></label>
-          <label>Width<input v-model.number="selectedTarget.width" type="number" min="1" @change="normalizeKeyboardRect" /></label>
-          <label>Height<input v-model.number="selectedTarget.height" type="number" min="1" @change="normalizeKeyboardRect" /></label>
+        <div class="target-editor">
+          <p v-if="selectedTarget?.kind === 'rect'" data-testid="selection-size" class="safety-note">点击区域：{{ selectedTarget.width }} × {{ selectedTarget.height }} px</p>
+          <button v-if="hasVisualFrame && selectedTarget?.kind !== 'rect'" class="button secondary tap-button" type="button" :disabled="Boolean(busy)" @click="createRectFromPoint">从当前点创建可编辑区域</button>
+          <div v-if="selectedTarget?.kind === 'rect'" class="click-settings" aria-label="点击区域像素边界">
+            <label>Left<input v-model.number="selectedTarget.left" type="number" min="0" @input="normalizeKeyboardRect" /></label>
+            <label>Top<input v-model.number="selectedTarget.top" type="number" min="0" @input="normalizeKeyboardRect" /></label>
+            <label>Width<input v-model.number="selectedTarget.width" type="number" min="1" @input="normalizeKeyboardRect" /></label>
+            <label>Height<input v-model.number="selectedTarget.height" type="number" min="1" @input="normalizeKeyboardRect" /></label>
+          </div>
         </div>
         <div class="click-settings">
           <label>延时下限<input v-model.number="appState.clickSettings.delayMinimumMs" type="number" min="0" /></label>
