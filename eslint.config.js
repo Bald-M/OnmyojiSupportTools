@@ -28,6 +28,7 @@ export default tseslint.config(
         HTMLInputElement: 'readonly',
         HTMLSelectElement: 'readonly',
         MouseEvent: 'readonly',
+        PointerEvent: 'readonly',
         EncodedVideoChunk: 'readonly',
         VideoDecoder: 'readonly',
         ResizeObserver: 'readonly',
