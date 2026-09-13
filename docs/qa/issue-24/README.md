@@ -2,7 +2,7 @@
 
 日期：2026-09-13。审查基准：`b40208cbb95c2851ce1d29150ce580a8cde25d9d`。规格：[GitHub Issue #24](https://github.com/Bald-M/OnmyojiSupportTools/issues/24)。
 
-本次实现鼠标创建、移动、八方向缩放，保留原有矩形 IPC 契约。设备输入和校准仍通过现有 DeviceManager 命令完成。以下结果来自 macOS，**原生 Windows x64 Tauri/WebView2 验收尚未完成**。
+本次实现鼠标创建、移动、八方向缩放，保留原有矩形 IPC 契约。设备输入和校准仍通过现有 DeviceManager 命令完成。自动检查在 macOS 和原生 Windows x64 CI 通过；浏览器交互证据来自 macOS Chromium。**实际 Windows Tauri/WebView2 交互验收尚未完成**。
 
 ## 自动化证据
 
@@ -18,11 +18,23 @@
 | 刷新截图、停止预览、设备变化清理 | App 测试验证清除选区，拖拽结束事件不会恢复旧目标；ADB 切换与预览失效也进入同一清理入口。 |
 | 数字同步与小选区手柄 | App 验证数字字段与覆盖层同步、立即限制非法值；浏览器实际命中测试证明小选区的八个 24px 手柄及中心移动控件互不重叠。原始像素边界由独立覆盖层显示。 |
 | 文档与完整检查 | README、CHANGELOG 与 Windows 验收矩阵已更新。`pnpm check`、`pnpm frontend:build` 通过。 |
-| Windows x64 构建与交互 | `pnpm build:windows:x64` 在 macOS 通过 cargo-xwin 交叉构建并验证 x64 NSIS 产物；原生 Windows 构建及 Tauri/WebView2 交互仍待验收。 |
+| Windows x64 构建与交互 | `pnpm build:windows:x64` 的 macOS 交叉构建及原生 Windows x64 CI 均通过；实际 Tauri/WebView2 交互仍待验收。 |
 
 最终 `pnpm check`：8 个构建脚本测试、35 个前端测试、43 个 Rust 测试通过；1 个 Rust 子进程辅助测试按项目既有方式忽略，由父测试启动。类型检查、ESLint、Rust fmt/clippy 通过。
 
-Windows 产物：`dist/OnmyojiSupportTools_0.1.0_windows_x64_nsis-setup.exe`。构建日志有交叉编译签名限制及 MSVC PDB 相关既有警告，未将这些警告视为原生 Windows 验收证据。
+Windows 产物：`dist/OnmyojiSupportTools_0.1.0_windows_x64_nsis-setup.exe`。macOS 构建日志有交叉编译签名限制及 MSVC PDB 相关既有警告，原生 CI 结果独立记录如下。
+
+## 原生 Windows CI
+
+[CI run 34732873992](https://github.com/Bald-M/OnmyojiSupportTools/actions/runs/34732873992) 已完成，结论 `success`，检查提交 `dac50270fe6021518cb305f80a8032955b5161fd`：
+
+- `Quality · Windows x64`：`pnpm check` 与 `pnpm frontend:build` 通过，35 个前端测试和 43 个 Rust 测试通过。
+- `Build · Windows x64`：原生 `pnpm build:windows:x64` 通过，日志确认 `platform=windows architecture=x64 target=x86_64-pc-windows-msvc`；NSIS 产物上传成功。
+- `pr-title`：workflow_dispatch 没有 PR，按工作流条件跳过。
+
+已下载原生 CI 产物并替换本机 `dist/` 中的交叉构建安装包。`dist/` 仅保留 `OnmyojiSupportTools_0.1.0_windows_x64_nsis-setup.exe`，大小 5,625,030 字节，SHA-256：`7c41b8ae986d363ed9675be23d5ec1e6376a39a117a76a2b0c32509fbb93e806`。
+
+此 CI 证明原生构建和自动检查；没有执行 Tauri/WebView2 鼠标交互验收。
 
 ## 可重放的真实浏览器 QA
 
@@ -55,8 +67,8 @@ node scripts/qa-region-editor.mjs /absolute/path/to/playwright/index.mjs /absolu
 
 Standards：0 项违规，0 项待修复代码异味。
 
-Spec：初审发现小区域手柄覆盖移动入口及缺少实际命中测试，均已修复；复审未发现新的可修复实现问题。原生 Windows 验收要求仍部分完成。
+Spec：初审发现小区域手柄覆盖移动入口及缺少实际命中测试，均已修复；复审未发现新的可修复实现问题。原生 Windows 构建与自动检查已完成；实际 Tauri/WebView2 交互要求仍未完成。
 
 ## 待完成
 
-按 [Windows 验收矩阵](../../windows-acceptance.md#鼠标区域编辑issue-24) 在原生 Windows x64 + Tauri/WebView2 窗口执行 Issue #24 项目，记录 Windows/WebView2/模拟器版本及结果。不得将本记录中的 macOS Chromium 或交叉构建结果填写为原生 Windows 通过。
+按 [Windows 验收矩阵](../../windows-acceptance.md#鼠标区域编辑issue-24) 在原生 Windows x64 + Tauri/WebView2 窗口执行 Issue #24 项目，记录 Windows/WebView2/模拟器版本及结果。构建项已由原生 CI 完成；不得将 macOS Chromium 或 CI 构建结果填写为 Windows WebView2 交互通过。

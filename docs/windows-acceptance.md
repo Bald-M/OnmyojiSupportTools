@@ -79,7 +79,7 @@
 
 以下项目必须在 Windows x64 的原生 Tauri/WebView2 窗口验收。自动化及交叉构建证据见 [Issue #24 验证记录](qa/issue-24/README.md)，不能替代这些项目。
 
-- [ ] 原生执行 `pnpm check`、`pnpm frontend:build`、`pnpm build:windows:x64`；确认版本、Windows、x64 均出现在安装包名称中。
+- [x] 原生执行 `pnpm check`、`pnpm frontend:build`、`pnpm build:windows:x64`；确认版本、Windows、x64 均出现在安装包名称中。已由 [Windows CI run 34732873992](https://github.com/Bald-M/OnmyojiSupportTools/actions/runs/34732873992) 完成。
 - [ ] “创建区域”支持四向框选，实时尺寸与原始像素一致；横纵留白不能开始框选，边界和单像素区域合法。
 - [ ] 调整窗口大小后，从默认 40 × 40 及更小区域开始，拖动内部或中心十字移动，八个手柄均可放大/缩小且不互相遮挡；小选区外围手柄不改变原始像素边界。
 - [ ] 移动保持尺寸；画面外释放后编辑结束，再移动鼠标没有后续变化；取消或失去指针捕获后可重新编辑。
