@@ -38,6 +38,7 @@ const readyState: AppState = {
   clickSettings: { delayMinimumMs: 300, delayMaximumMs: 900, pointRadius: 6, pressMinimumMs: 45, pressMaximumMs: 120 },
   activityConfigs: [],
   activitySession: { configId: '', status: 'idle', currentState: null, targetRuns: 0, completedRuns: 0, retryCount: 0, pauseReason: null, lastSafeAction: null, lastEvent: null },
+  deviceDiscoveryWarnings: [],
 }
 
 async function pointer(element: Element, type: string, x: number, y: number) {
@@ -325,6 +326,38 @@ describe('desktop device workflow', () => {
     expect(options[2]?.text()).toContain('未授权')
     expect(options[2]?.attributes('disabled')).toBeDefined()
     expect(wrapper.get('[data-testid="capture-button"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('reports partial MuMu discovery failures without hiding discovered devices', async () => {
+    device.refreshDevices.mockResolvedValueOnce({
+      ...readyState,
+      deviceDiscoveryWarnings: ['MuMu 127.0.0.1:16416 自动连接失败：连接被拒绝'],
+    })
+    const wrapper = mount(App)
+    await flushPromises()
+
+    await wrapper.get('[aria-label="刷新设备列表"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('.status-bar').text()).toContain('发现 1 台设备')
+    expect(wrapper.get('.status-bar').text()).toContain('16416')
+    expect(wrapper.findAll('#device-select option')).toHaveLength(2)
+  })
+
+  it.each([
+    { label: 'zero', devices: [], activeDeviceSerial: null, expectedOptions: 1 },
+    { label: 'one', devices: readyState.devices, activeDeviceSerial: readyState.devices[0]!.serial, expectedOptions: 2 },
+    { label: 'multiple', devices: [readyState.devices[0]!, { ...readyState.devices[0]!, serial: '127.0.0.1:16416', transport: '2' }], activeDeviceSerial: readyState.devices[0]!.serial, expectedOptions: 3 },
+  ])('renders $label devices returned by refresh', async ({ devices, activeDeviceSerial, expectedOptions }) => {
+    device.refreshDevices.mockResolvedValueOnce({ ...readyState, devices, activeDeviceSerial })
+    const wrapper = mount(App)
+    await flushPromises()
+
+    await wrapper.get('[aria-label="刷新设备列表"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.findAll('#device-select option')).toHaveLength(expectedOptions)
+    expect(wrapper.get('.status-bar').text()).toContain(`发现 ${devices.length} 台设备`)
   })
 
   it('starts and stops preview explicitly without tapping the device', async () => {

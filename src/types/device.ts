@@ -90,6 +90,7 @@ export interface AppState {
   clickSettings: ClickSettings
   activityConfigs: ActivityConfig[]
   activitySession: ActivitySession
+  deviceDiscoveryWarnings: string[]
 }
 
 export interface AppError {

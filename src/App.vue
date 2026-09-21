@@ -56,6 +56,7 @@ const emptyState: AppState = {
   clickSettings: { delayMinimumMs: 300, delayMaximumMs: 900, pointRadius: 6, pressMinimumMs: 45, pressMaximumMs: 120 },
   activityConfigs: [],
   activitySession: { configId: '', status: 'idle', currentState: null, targetRuns: 0, completedRuns: 0, retryCount: 0, pauseReason: null, lastSafeAction: null, lastEvent: null },
+  deviceDiscoveryWarnings: [],
 }
 
 const appState = ref<AppState>(emptyState)
@@ -425,10 +426,11 @@ async function initialize() {
     const state = await getAppAppState()
     applyState(state)
     setStatus(
-      'neutral',
+      state.deviceDiscoveryWarnings.length ? 'error' : 'neutral',
       state.selectedAdb
-        ? '设备环境已就绪。'
+        ? state.deviceDiscoveryWarnings[0] ?? '设备环境已就绪。'
         : '未检测到可用的 ADB，请手动选择 adb.exe。',
+      state.deviceDiscoveryWarnings.length ? '已保留 ADB 当前可见设备；可重试或使用手动连接。' : null,
     )
   } catch (error) {
     const appError = normalizeError(error)
@@ -479,7 +481,15 @@ function handleDeviceChange(event: Event) {
 function handleRefreshDevices() {
   void runOperation('devices', refreshDevices, (state) => {
     applyState(state)
-    setStatus('success', `设备列表已刷新，发现 ${state.devices.length} 台设备。`)
+    if (state.deviceDiscoveryWarnings.length) {
+      setStatus(
+        'error',
+        `设备列表已刷新，发现 ${state.devices.length} 台设备；${state.deviceDiscoveryWarnings.join('；')}`,
+        '其他设备仍可使用；可重试或使用手动连接。',
+      )
+    } else {
+      setStatus('success', `设备列表已刷新，发现 ${state.devices.length} 台设备。`)
+    }
   })
 }
 

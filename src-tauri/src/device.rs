@@ -24,6 +24,7 @@ use crate::activity::{
     VisualFeature, extract_feature, recognize, recognize_popup,
 };
 use crate::click::{ClickTarget, FrameBounds, Point, sample_target};
+use crate::emulator_discovery::{LocalEmulatorDiscovery, SystemLocalEmulatorDiscovery};
 use crate::preview::{
     AdbScreenrecordPreviewBackend, PreviewBackend, PreviewController, PreviewEndSink, PreviewSink,
 };
@@ -189,6 +190,7 @@ pub struct AppState {
     pub click_settings: ClickSettings,
     pub activity_configs: Vec<ActivityConfig>,
     pub activity_session: ActivitySession,
+    pub device_discovery_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, thiserror::Error)]
@@ -350,6 +352,7 @@ struct RuntimeState {
     activity_session: ActivitySession,
     activity_deadline: Option<tokio::time::Instant>,
     handled_popups: u8,
+    device_discovery_warnings: Vec<String>,
 }
 
 impl RuntimeState {
@@ -378,6 +381,7 @@ pub struct DeviceManager {
     state: RwLock<RuntimeState>,
     preview: PreviewController,
     activity_runtime: Arc<dyn ActivityRuntime>,
+    emulator_discovery: Arc<dyn LocalEmulatorDiscovery>,
 }
 
 impl DeviceManager {
@@ -463,7 +467,19 @@ impl DeviceManager {
             state: RwLock::new(RuntimeState::default()),
             preview: PreviewController::new(preview_backend),
             activity_runtime: Arc::new(SystemActivityRuntime),
+            emulator_discovery: Arc::new(SystemLocalEmulatorDiscovery),
         }
+    }
+
+    #[cfg(test)]
+    fn with_runner_and_emulator_discovery(
+        config_path: PathBuf,
+        runner: Arc<dyn CommandRunner>,
+        emulator_discovery: Arc<dyn LocalEmulatorDiscovery>,
+    ) -> Self {
+        let mut manager = Self::with_runner(config_path, runner);
+        manager.emulator_discovery = emulator_discovery;
+        manager
     }
 
     #[cfg(test)]
@@ -571,17 +587,15 @@ impl DeviceManager {
     pub async fn refresh_devices(&self) -> Result<AppState, AppError> {
         let adb = self.selected_adb_path().await?;
         self.ensure_bundled_server(&adb).await?;
-        let args = self.adb_args(&adb, &["devices", "-l"]);
-        let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
-        ensure_success(
-            output.success,
-            &output.stdout,
-            &output.stderr,
-            "DEVICE_LIST_FAILED",
-            "无法读取设备列表",
-            "请检查 ADB 和模拟器状态后重试",
-        )?;
-        let devices = parse_devices(&String::from_utf8_lossy(&output.stdout));
+        let initial_devices = self.list_devices(&adb).await?;
+        let (attempted_discovery, warnings) = self
+            .connect_discovered_mumu_devices(&adb, &initial_devices)
+            .await;
+        let devices = if attempted_discovery {
+            self.list_devices(&adb).await?
+        } else {
+            initial_devices
+        };
 
         let mut state = self.state.write().await;
         let previous = state.active_device_serial.clone();
@@ -604,11 +618,87 @@ impl DeviceManager {
             state.invalidate_device_context("活动设备已失效或切换");
         }
         state.devices = devices;
+        state.device_discovery_warnings = warnings;
         state.active_device_serial = active.clone();
         state.config.active_device_serial = active;
         self.save_config(&state.config)?;
         drop(state);
         Ok(self.snapshot().await)
+    }
+
+    async fn list_devices(&self, adb: &Path) -> Result<Vec<DeviceSummary>, AppError> {
+        let args = self.adb_args(adb, &["devices", "-l"]);
+        let output = self.runner.run(adb, &args, ADB_TIMEOUT).await?;
+        ensure_success(
+            output.success,
+            &output.stdout,
+            &output.stderr,
+            "DEVICE_LIST_FAILED",
+            "无法读取设备列表",
+            "请检查 ADB 和模拟器状态后重试",
+        )?;
+        Ok(parse_devices(&String::from_utf8_lossy(&output.stdout)))
+    }
+
+    async fn connect_discovered_mumu_devices(
+        &self,
+        adb: &Path,
+        existing_devices: &[DeviceSummary],
+    ) -> (bool, Vec<String>) {
+        let ports = match self.emulator_discovery.discover_mumu_adb_ports() {
+            Ok(ports) => ports,
+            Err(error) => return (false, vec![format!("MuMu 自动发现失败：{error}")]),
+        };
+        let existing: HashSet<_> = existing_devices
+            .iter()
+            .map(|device| device.serial.as_str())
+            .collect();
+        let mut seen_ports = HashSet::new();
+        let mut attempted = false;
+        let mut warnings = Vec::new();
+        for port in ports {
+            if !seen_ports.insert(port) {
+                continue;
+            }
+            let serial = format!("127.0.0.1:{port}");
+            if existing.contains(serial.as_str()) {
+                continue;
+            }
+            attempted = true;
+            if let Err(error) = self.connect_and_verify_mumu(adb, &serial).await {
+                warnings.push(format!("MuMu {serial} 自动连接失败：{}", error.message));
+            }
+        }
+        (attempted, warnings)
+    }
+
+    async fn connect_and_verify_mumu(&self, adb: &Path, serial: &str) -> Result<(), AppError> {
+        let args = self.adb_args(adb, &["connect", serial]);
+        let output = self.runner.run(adb, &args, ADB_TIMEOUT).await?;
+        ensure_success(
+            output.success,
+            &output.stdout,
+            &output.stderr,
+            "DEVICE_CONNECT_FAILED",
+            "连接自动发现的 MuMu 设备失败",
+            "请确认 MuMu 实例仍在运行且已启用 ADB",
+        )?;
+        ensure_connect_response(&output.stdout)?;
+
+        let args = self.adb_args(adb, &["-s", serial, "shell", "getprop", "ro.product.model"]);
+        let output = self.runner.run(adb, &args, ADB_TIMEOUT).await?;
+        let verified = output.success && !String::from_utf8_lossy(&output.stdout).trim().is_empty();
+        if verified {
+            return Ok(());
+        }
+
+        let disconnect_args = self.adb_args(adb, &["disconnect", serial]);
+        let _ = self.runner.run(adb, &disconnect_args, ADB_TIMEOUT).await;
+        Err(AppError::new(
+            "DEVICE_VERIFY_FAILED",
+            "自动发现的端口未返回 Android 设备型号",
+            "请检查 MuMu 的 ADB 设置，或使用手动连接",
+        ))
     }
 
     pub async fn connect_device(&self, endpoint: ConnectEndpoint) -> Result<AppState, AppError> {
@@ -1599,6 +1689,7 @@ fn snapshot_from(state: &RuntimeState) -> AppState {
         click_settings: state.config.click_settings,
         activity_configs: state.config.activity_configs.clone(),
         activity_session: state.activity_session.clone(),
+        device_discovery_warnings: state.device_discovery_warnings.clone(),
     }
 }
 
@@ -1933,9 +2024,10 @@ mod tests {
     use super::{
         ActivityRuntime, AdbCandidate, AdbServerIdentity, AdbServerProbe, AdbServerStatusProto,
         AdbSource, AppError, BundledAdbDistribution, BundledAdbFile, CommandOutput, CommandRunner,
-        ConnectEndpoint, DeviceManager, Point, ensure_bundled_server_port_available,
-        ensure_success, parse_devices, parse_endpoint, query_adb_server_identity,
-        select_initial_adb, strings, validate_bundled_adb_files, validate_png,
+        ConnectEndpoint, DeviceManager, LocalEmulatorDiscovery, Point,
+        ensure_bundled_server_port_available, ensure_success, parse_devices, parse_endpoint,
+        query_adb_server_identity, select_initial_adb, strings, validate_bundled_adb_files,
+        validate_png,
     };
     use crate::activity::{
         ActivityConfig, FrameSpec, KnownPopup, Orientation, PageState, Rect, TaskStatus,
@@ -2046,6 +2138,16 @@ mod tests {
     struct FakeServerProbe {
         identities: Mutex<VecDeque<Result<AdbServerIdentity, AppError>>>,
         ports: Mutex<Vec<u16>>,
+    }
+
+    struct FakeEmulatorDiscovery {
+        result: Result<Vec<u16>, String>,
+    }
+
+    impl LocalEmulatorDiscovery for FakeEmulatorDiscovery {
+        fn discover_mumu_adb_ports(&self) -> Result<Vec<u16>, String> {
+            self.result.clone()
+        }
     }
 
     impl FakeServerProbe {
@@ -2594,6 +2696,175 @@ mod tests {
             state.active_device_serial.as_deref(),
             Some("127.0.0.1:16384")
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_connects_all_discovered_mumu_ports_and_tolerates_one_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, b"fake adb").unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643\n"),
+            success("List of devices attached\n"),
+            success("connected to 127.0.0.1:16384\n"),
+            success("MuMu 12\n"),
+            CommandOutput {
+                success: false,
+                stdout: b"failed to connect to 127.0.0.1:16416\n".to_vec(),
+                stderr: Vec::new(),
+            },
+            success(
+                "List of devices attached\n127.0.0.1:16384 device model:MuMu_12 transport_id:1\n",
+            ),
+        ]));
+        let discovery = Arc::new(FakeEmulatorDiscovery {
+            result: Ok(vec![16384, 16384, 16416]),
+        });
+        let manager = DeviceManager::with_runner_and_emulator_discovery(
+            directory.path().join("config.json"),
+            runner.clone(),
+            discovery,
+        );
+
+        manager.set_adb_path(adb_path).await.unwrap();
+        let state = manager.snapshot().await;
+
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(
+            state.active_device_serial.as_deref(),
+            Some("127.0.0.1:16384")
+        );
+        assert_eq!(state.device_discovery_warnings.len(), 1);
+        assert!(state.device_discovery_warnings[0].contains("16416"));
+        assert_eq!(
+            runner.calls().await,
+            vec![
+                strings(&["version"]),
+                strings(&["devices", "-l"]),
+                strings(&["connect", "127.0.0.1:16384"]),
+                strings(&[
+                    "-s",
+                    "127.0.0.1:16384",
+                    "shell",
+                    "getprop",
+                    "ro.product.model",
+                ]),
+                strings(&["connect", "127.0.0.1:16416"]),
+                strings(&["devices", "-l"]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_keeps_adb_devices_when_local_discovery_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, b"fake adb").unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643\n"),
+            success("List of devices attached\nemulator-5554 device model:Android\n"),
+        ]));
+        let discovery = Arc::new(FakeEmulatorDiscovery {
+            result: Err("无法读取本机 TCP 监听端口".to_owned()),
+        });
+        let manager = DeviceManager::with_runner_and_emulator_discovery(
+            directory.path().join("config.json"),
+            runner,
+            discovery,
+        );
+
+        let state = manager.set_adb_path(adb_path).await.unwrap();
+
+        assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.active_device_serial.as_deref(), Some("emulator-5554"));
+        assert_eq!(
+            state.device_discovery_warnings,
+            vec!["MuMu 自动发现失败：无法读取本机 TCP 监听端口"]
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_disconnects_a_discovered_port_that_is_not_an_android_device() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, b"fake adb").unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643\n"),
+            success("List of devices attached\n"),
+            success("connected to 127.0.0.1:16384\n"),
+            success("\n"),
+            success("disconnected 127.0.0.1:16384\n"),
+            success("List of devices attached\n"),
+        ]));
+        let manager = DeviceManager::with_runner_and_emulator_discovery(
+            directory.path().join("config.json"),
+            runner.clone(),
+            Arc::new(FakeEmulatorDiscovery {
+                result: Ok(vec![16384]),
+            }),
+        );
+
+        let state = manager.set_adb_path(adb_path).await.unwrap();
+
+        assert!(state.devices.is_empty());
+        assert!(state.device_discovery_warnings[0].contains("未返回 Android 设备型号"));
+        assert!(
+            runner
+                .calls()
+                .await
+                .contains(&strings(&["disconnect", "127.0.0.1:16384"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_the_selected_device_when_multiple_devices_stay_online() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, b"fake adb").unwrap();
+        let devices =
+            "List of devices attached\nfirst device model:MuMu_12\nsecond device model:MuMu_12\n";
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643\n"),
+            success(devices),
+            success(devices),
+        ]));
+        let manager = DeviceManager::with_runner_and_emulator_discovery(
+            directory.path().join("config.json"),
+            runner,
+            Arc::new(FakeEmulatorDiscovery { result: Ok(vec![]) }),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.select_device("second".to_owned()).await.unwrap();
+
+        let state = manager.refresh_devices().await.unwrap();
+
+        assert_eq!(state.devices.len(), 2);
+        assert_eq!(state.active_device_serial.as_deref(), Some("second"));
+    }
+
+    #[tokio::test]
+    async fn refresh_invalidates_the_frame_when_the_active_device_disappears() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, b"fake adb").unwrap();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 37.0.1-14129643\n"),
+            success("List of devices attached\nfirst device model:MuMu_12\n"),
+            success_bytes(&solid_png([20, 30, 40])),
+            success("List of devices attached\n"),
+        ]));
+        let manager = DeviceManager::with_runner_and_emulator_discovery(
+            directory.path().join("config.json"),
+            runner,
+            Arc::new(FakeEmulatorDiscovery { result: Ok(vec![]) }),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.capture_screen().await.unwrap();
+
+        let state = manager.refresh_devices().await.unwrap();
+
+        assert!(state.active_device_serial.is_none());
+        assert!(state.last_frame.is_none());
     }
 
     #[tokio::test]
