@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    process::Command,
     sync::{Mutex, RwLock},
     time::timeout,
 };
@@ -28,6 +27,7 @@ use crate::emulator_discovery::{LocalEmulatorDiscovery, SystemLocalEmulatorDisco
 use crate::preview::{
     AdbScreenrecordPreviewBackend, PreviewBackend, PreviewController, PreviewEndSink, PreviewSink,
 };
+use crate::process::adb_command;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const ADB_TIMEOUT: Duration = Duration::from_secs(8);
@@ -242,7 +242,7 @@ impl CommandRunner for ProcessRunner {
         args: &[String],
         limit: Duration,
     ) -> Result<CommandOutput, AppError> {
-        let mut command = Command::new(program);
+        let mut command = adb_command(program);
         command
             .args(args)
             .stdin(Stdio::null())
@@ -2021,6 +2021,8 @@ mod tests {
     use std::io::Cursor;
     use tokio::sync::Mutex;
 
+    #[cfg(target_os = "windows")]
+    use super::ProcessRunner;
     use super::{
         ActivityRuntime, AdbCandidate, AdbServerIdentity, AdbServerProbe, AdbServerStatusProto,
         AdbSource, AppError, BundledAdbDistribution, BundledAdbFile, CommandOutput, CommandRunner,
@@ -2034,6 +2036,30 @@ mod tests {
         TimingRange, extract_feature,
     };
     use crate::preview::{PreviewBackend, PreviewEndSink, PreviewSessionHandle, PreviewSink};
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn command_runner_does_not_create_a_console_window() {
+        let output = ProcessRunner
+            .run(
+                &std::env::current_exe().unwrap(),
+                &[
+                    "--ignored".to_owned(),
+                    "--exact".to_owned(),
+                    "process::tests::console_window_probe".to_owned(),
+                    "--nocapture".to_owned(),
+                ],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            output.success,
+            "console probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     struct FakeRunner {
         outputs: Mutex<VecDeque<Result<CommandOutput, AppError>>>,

@@ -12,13 +12,12 @@ use async_trait::async_trait;
 use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
-    process::Command,
     sync::Mutex,
     task::JoinHandle,
     time::timeout,
 };
 
-use crate::device::AppError;
+use crate::{device::AppError, process::adb_command};
 
 pub(crate) type PreviewSink = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 pub(crate) type PreviewEndSink = Arc<dyn Fn(PreviewEnd) + Send + Sync>;
@@ -149,7 +148,7 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
         on_end: PreviewEndSink,
         live: Arc<AtomicBool>,
     ) -> Result<Box<dyn PreviewSessionHandle>, AppError> {
-        let mut command = Command::new(program);
+        let mut command = adb_command(program);
         command
             .args(args)
             .stdin(Stdio::null())
@@ -279,6 +278,41 @@ mod tests {
 
     struct EndedBackend;
     struct EndedSession;
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn preview_backend_does_not_create_a_console_window() {
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        let ended_tx = std::sync::Mutex::new(Some(ended_tx));
+        let args = [
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "process::tests::console_window_probe".to_owned(),
+            "--nocapture".to_owned(),
+        ];
+        let session = AdbScreenrecordPreviewBackend
+            .start(
+                &std::env::current_exe().unwrap(),
+                &args,
+                Arc::new(|_| {}),
+                Arc::new(move |end| {
+                    if let Some(sender) = ended_tx.lock().unwrap().take() {
+                        let _ = sender.send(end);
+                    }
+                }),
+                Arc::new(AtomicBool::new(true)),
+            )
+            .await
+            .unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), ended_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(end.code, PreviewEndCode::StreamEof);
+        assert_eq!(end.exit_code, Some(0));
+        session.stop().await;
+    }
 
     #[async_trait]
     impl PreviewSessionHandle for EndedSession {
