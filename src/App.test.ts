@@ -37,7 +37,7 @@ const readyState: AppState = {
   previewDeviceSerial: null,
   clickSettings: { delayMinimumMs: 300, delayMaximumMs: 900, pointRadius: 6, pressMinimumMs: 45, pressMaximumMs: 120 },
   activityConfigs: [],
-  activitySession: { configId: '', status: 'idle', currentState: null, targetRuns: 0, completedRuns: 0, retryCount: 0, pauseReason: null, lastSafeAction: null, lastEvent: null },
+  activitySession: { configId: '', status: 'idle', currentState: null, targetRuns: 0, completedRuns: 0, nextOpponentIndex: 0, attemptedOpponents: [], failedOpponents: [], consecutiveFailures: 0, retryCount: 0, pauseReason: null, lastSafeAction: null, lastEvent: null },
 }
 
 async function pointer(element: Element, type: string, x: number, y: number) {
@@ -48,10 +48,11 @@ async function pointer(element: Element, type: string, x: number, y: number) {
 }
 
 const pageStates: PageState[] = ['activityEntry', 'stageEntry', 'challenge', 'battling', 'reward', 'returnChallenge']
+const realmRaidStates: PageState[] = ['activityEntry', 'stageEntry', 'challenge', 'opponent', 'battleReady', 'battling', 'reward', 'defeat']
 const activityConfig: ActivityConfig = {
-  version: 1, id: 'activity-1', name: '测试活动', frame: { width: 1280, height: 720, orientation: 'landscape' },
+  version: 1, id: 'activity-1', name: '测试活动', kind: 'generic', frame: { width: 1280, height: 720, orientation: 'landscape' },
   states: pageStates.map((state) => ({ state, features: [], action: null, clickDelay: null, pressDuration: null })),
-  knownPopups: [], matching: { threshold: 0.9, minimumMargin: 0.08 }, clickDelay: { minimumMs: 0, maximumMs: 0 }, pressDuration: { minimumMs: 1, maximumMs: 1 },
+  knownPopups: [], matching: { threshold: 0.9, minimumMargin: 0.08 }, clickDelay: { minimumMs: 0, maximumMs: 0 }, pressDuration: { minimumMs: 1, maximumMs: 1 }, realmRaid: null,
 }
 
 describe('desktop device workflow', () => {
@@ -432,16 +433,30 @@ describe('desktop device workflow', () => {
     expect(device.resumeActivity).toHaveBeenCalledOnce()
   })
 
-  it('loads all six calibration states, renames, previews ambiguity, and deletes a config', async () => {
+  it('rejects a target above the thirty-ticket capacity before invoking Tauri', async () => {
+    device.getAppAppState.mockResolvedValueOnce({ ...readyState, activityConfigs: [activityConfig] })
+    const wrapper = mount(App)
+    await flushPromises()
+    await wrapper.get('#activity-config').setValue('activity-1')
+    await wrapper.get('#target-runs').setValue(31)
+    await wrapper.get('[data-testid="activity-start"]').trigger('click')
+    await flushPromises()
+
+    expect(device.startActivity).not.toHaveBeenCalled()
+    expect(wrapper.get('.status-bar').text()).toContain('1 到 30')
+  })
+
+  it('starts new calibration with all eight realm-raid states, then loads and manages a generic config', async () => {
     device.getAppAppState.mockResolvedValueOnce({ ...readyState, activityConfigs: [activityConfig] })
     device.previewActivityRecognition.mockResolvedValueOnce({ matchedState: null, scores: pageStates.map((state) => ({ state, score: 0.5 })), reason: 'ambiguous' })
     vi.spyOn(window, 'confirm').mockReturnValueOnce(true)
     const wrapper = mount(App)
     await flushPromises()
 
-    expect(wrapper.findAll('#calibration-state option').map((option) => option.attributes('value'))).toEqual(pageStates)
+    expect(wrapper.findAll('#calibration-state option').map((option) => option.attributes('value'))).toEqual(realmRaidStates)
     await wrapper.get('#activity-config').setValue('activity-1')
     await wrapper.get('#activity-config').trigger('change')
+    expect(wrapper.findAll('#calibration-state option').map((option) => option.attributes('value'))).toEqual(pageStates)
     await wrapper.get('#activity-name').setValue('重命名活动')
     const save = wrapper.findAll('button').find((button) => button.text() === '保存配置')!
     expect((wrapper.get('#activity-config').element as HTMLSelectElement).value).toBe('activity-1')
@@ -476,12 +491,32 @@ describe('desktop device workflow', () => {
     await pointer(stage.element, 'pointerup', 300, 150)
     await wrapper.findAll('button').find((button) => button.text() === '新建配置')!.trigger('click')
 
-    for (const state of pageStates) {
+    for (const state of realmRaidStates) {
       await wrapper.get('#calibration-state').setValue(state)
       await wrapper.findAll('button').find((button) => button.text() === '添加识别区域')!.trigger('click')
       await flushPromises()
-      if (state !== 'battling') {
+      if (state === 'challenge') {
+        const addOpponent = wrapper.findAll('button').find((button) => button.text() === '添加对手区域')!
+        for (let index = 0; index < 9; index += 1) {
+          await addOpponent.trigger('click')
+          await wrapper.findAll('button').find((button) => button.text() === '添加当前对手可挑战特征')!.trigger('click')
+          await flushPromises()
+        }
+        await wrapper.findAll('button').find((button) => button.text() === '设为刷新区域')!.trigger('click')
+        await wrapper.findAll('button').find((button) => button.text() === '添加刷新可用特征')!.trigger('click')
+        await flushPromises()
+        for (let index = 0; index < 3; index += 1) {
+          await wrapper.findAll('button').find((button) => button.text() === '添加 3/6/9 奖励区域')!.trigger('click')
+          await wrapper.findAll('button').find((button) => button.text() === '添加当前奖励可领取特征')!.trigger('click')
+          await flushPromises()
+        }
+      } else if (state !== 'battling') {
         await wrapper.findAll('button').find((button) => button.text() === '设为动作区域')!.trigger('click')
+        if (state === 'opponent') {
+          await wrapper.findAll('button').find((button) => button.text() === '添加进攻门禁特征')!.trigger('click')
+          await wrapper.findAll('button').find((button) => button.text() === '添加进攻门禁特征')!.trigger('click')
+          await flushPromises()
+        }
       }
     }
     await wrapper.findAll('button').find(button => button.text() === '添加弹窗识别区域')!.trigger('click')
@@ -491,10 +526,17 @@ describe('desktop device workflow', () => {
     await flushPromises()
 
     const saved = device.saveActivityConfig.mock.calls[0]![0] as ActivityConfig
-    expect(saved.states).toHaveLength(6)
+    expect(saved.kind).toBe('realmRaid')
+    expect(saved.states).toHaveLength(8)
     expect(saved.states.every((profile) => profile.features.length === 1)).toBe(true)
-    expect(saved.states.filter((profile) => profile.state !== 'battling').every((profile) => profile.action)).toBe(true)
+    expect(saved.states.filter((profile) => !['battling', 'challenge'].includes(profile.state)).every((profile) => profile.action)).toBe(true)
     expect(saved.states.find((profile) => profile.state === 'battling')?.action).toBeNull()
+    expect(saved.realmRaid?.opponents).toHaveLength(9)
+    expect(saved.realmRaid?.opponents.every((opponent) => opponent.availableFeatures.length === 1)).toBe(true)
+    expect(saved.realmRaid?.refresh.action).toEqual({ left: 100, top: 50, width: 200, height: 100 })
+    expect(saved.realmRaid?.refresh.features).toHaveLength(1)
+    expect(saved.realmRaid?.progressRewards).toHaveLength(3)
+    expect(saved.realmRaid?.attackRequirements).toHaveLength(2)
     expect(saved.knownPopups[0]?.closeAction).toEqual({ left: 100, top: 50, width: 200, height: 100 })
     expect(saved.knownPopups[0]?.features).toHaveLength(1)
     expect(device.calibrateActivityFeature).toHaveBeenLastCalledWith({ left: 100, top: 50, width: 200, height: 100 })

@@ -36,25 +36,42 @@ export interface ClickSettings {
   pressMaximumMs: number
 }
 
-export type PageState = 'activityEntry' | 'stageEntry' | 'challenge' | 'battling' | 'reward' | 'returnChallenge'
+export type ActivityKind = 'generic' | 'realmRaid'
+export type PageState = 'activityEntry' | 'stageEntry' | 'challenge' | 'opponent' | 'battleReady' | 'battling' | 'reward' | 'defeat' | 'returnChallenge'
 export type TaskStatus = 'idle' | 'navigating' | 'ready' | 'starting' | 'battling' | 'rewarding' | 'paused' | 'completed' | 'failed'
 export interface ActivityRect { left: number; top: number; width: number; height: number }
 export interface VisualFeature { region: ActivityRect; signature: number[] }
+export interface FeatureAction { features: VisualFeature[]; action: ActivityRect | null }
+export interface RealmRaidOpponent { availableFeatures: VisualFeature[]; action: ActivityRect }
 export interface StateProfile { state: PageState; features: VisualFeature[]; action: ActivityRect | null; clickDelay: { minimumMs: number; maximumMs: number } | null; pressDuration: { minimumMs: number; maximumMs: number } | null }
 export interface ActivityConfig {
   version: number
   id: string
   name: string
+  kind: ActivityKind
   frame: { width: number; height: number; orientation: 'landscape' | 'portrait' }
   states: StateProfile[]
   knownPopups: { name: string; features: VisualFeature[]; closeAction: ActivityRect; clickDelay: { minimumMs: number; maximumMs: number } | null; pressDuration: { minimumMs: number; maximumMs: number } | null }[]
   matching: { threshold: number; minimumMargin: number }
   clickDelay: { minimumMs: number; maximumMs: number }
   pressDuration: { minimumMs: number; maximumMs: number }
+  realmRaid: {
+    opponents: RealmRaidOpponent[]
+    refresh: FeatureAction
+    progressRewards: FeatureAction[]
+    attackRequirements: VisualFeature[]
+    failureLimit: number
+    pauseConditions: { name: string; features: VisualFeature[] }[]
+  } | null
 }
+export type SafeAction =
+  | { kind: 'page'; value: PageState }
+  | { kind: 'realmRaidOpponent'; value: number }
+  | { kind: 'realmRaidRefresh' }
+  | { kind: 'realmRaidProgressReward'; value: number }
 export interface ActivitySession {
   configId: string; status: TaskStatus; currentState: PageState | null; targetRuns: number
-  completedRuns: number; retryCount: number; pauseReason: { code: string; message: string } | null; lastSafeAction: string | null
+  completedRuns: number; nextOpponentIndex: number; attemptedOpponents: number[]; failedOpponents: number[]; consecutiveFailures: number; retryCount: number; pauseReason: { code: string; message: string } | null; lastSafeAction: SafeAction | null
   lastEvent: { kind: string; detail: string } | null
 }
 export interface RecognitionResult {
