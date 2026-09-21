@@ -55,7 +55,7 @@ const emptyState: AppState = {
   previewDeviceSerial: null,
   clickSettings: { delayMinimumMs: 300, delayMaximumMs: 900, pointRadius: 6, pressMinimumMs: 45, pressMaximumMs: 120 },
   activityConfigs: [],
-  activitySession: { configId: '', status: 'idle', currentState: null, targetRuns: 0, completedRuns: 0, retryCount: 0, pauseReason: null, lastSafeAction: null, lastEvent: null },
+  activitySession: { configId: '', status: 'idle', currentState: null, targetRuns: 0, completedRuns: 0, nextOpponentIndex: 0, attemptedOpponents: [], failedOpponents: [], consecutiveFailures: 0, retryCount: 0, pauseReason: null, lastSafeAction: null, lastEvent: null },
   deviceDiscoveryWarnings: [],
 }
 
@@ -89,7 +89,7 @@ let previewFailurePending = false
 let activityTimer: number | null = null
 let tapCountdownTimer: number | null = null
 const tapCountdown = ref(0)
-const activityName = ref('活动配置')
+const activityName = ref('结界突破')
 const popupName = ref('悬赏邀请')
 const selectedConfigId = ref('')
 const selectedCalibrationState = ref<PageState>('activityEntry')
@@ -101,7 +101,24 @@ const overrideDelayMaximum = ref<number | null>(null)
 const overridePressMinimum = ref<number | null>(null)
 const overridePressMaximum = ref<number | null>(null)
 const draftConfig = ref<ActivityConfig | null>(null)
-const pageLabels: Record<PageState, string> = { activityEntry: '活动入口', stageEntry: '关卡入口', challenge: '首次挑战页', battling: '战斗中', reward: '奖励页', returnChallenge: '返回挑战页' }
+const pageLabels: Record<PageState, string> = {
+  activityEntry: '庭院探索入口',
+  stageEntry: '探索地图结界突破入口',
+  challenge: '结界突破九宫格',
+  opponent: '对手详情',
+  battleReady: '战斗准备',
+  battling: '战斗中',
+  reward: '胜利奖励',
+  defeat: '失败结算',
+  returnChallenge: '返回挑战页',
+}
+const realmRaidStates: PageState[] = ['activityEntry', 'stageEntry', 'challenge', 'opponent', 'battleReady', 'battling', 'reward', 'defeat']
+const genericStates: PageState[] = ['activityEntry', 'stageEntry', 'challenge', 'battling', 'reward', 'returnChallenge']
+const calibrationStates = computed(() => draftConfig.value?.kind === 'generic' ? genericStates : realmRaidStates)
+const targetRunsError = computed(() => {
+  const value = Number(targetRuns.value)
+  return Number.isInteger(value) && value >= 1 && value <= 30 ? null : '请输入 1 到 30 的整数。'
+})
 const adbSourceLabels: Record<AdbSource, string> = {
   bundled: '应用内置',
   saved: '上次使用',
@@ -225,11 +242,19 @@ function ensureDraft(): ActivityConfig | null {
   if (draftConfig.value) return draftConfig.value
   if (!imageSize.width || !imageSize.height) return null
   draftConfig.value = {
-    version: 1, id: window.crypto.randomUUID(), name: activityName.value,
+    version: 1, id: window.crypto.randomUUID(), name: activityName.value, kind: 'realmRaid',
     frame: { width: imageSize.width, height: imageSize.height, orientation: imageSize.width >= imageSize.height ? 'landscape' : 'portrait' },
-    states: (Object.keys(pageLabels) as PageState[]).map((state) => ({ state, features: [], action: null, clickDelay: null, pressDuration: null })),
+    states: realmRaidStates.map((state) => ({ state, features: [], action: null, clickDelay: null, pressDuration: null })),
     knownPopups: [], matching: { threshold: 0.9, minimumMargin: 0.08 },
     clickDelay: { minimumMs: 300, maximumMs: 900 }, pressDuration: { minimumMs: 45, maximumMs: 120 },
+    realmRaid: {
+      opponents: [],
+      refresh: { features: [], action: null },
+      progressRewards: [],
+      attackRequirements: [],
+      failureLimit: 3,
+      pauseConditions: [],
+    },
   }
   return draftConfig.value
 }
@@ -274,6 +299,76 @@ function setCalibrationAction() {
   setStatus('success', `已设置${pageLabels[selectedCalibrationState.value]}动作区域。`)
 }
 
+function addRealmRaidOpponentAction() {
+  const rect = selectedRect(); const draft = ensureDraft()
+  if (!rect || draft?.kind !== 'realmRaid' || !draft.realmRaid) { setStatus('error', '请先框选九宫格中的对手区域。'); return }
+  if (draft.realmRaid.opponents.length >= 9) { setStatus('error', '九个对手区域已经全部设置。'); return }
+  draft.realmRaid.opponents.push({ action: rect, availableFeatures: [] })
+  setStatus('success', `已添加第 ${draft.realmRaid.opponents.length} 个对手区域；请继续添加它的可挑战特征。`)
+}
+
+function setRealmRaidRefreshAction() {
+  const rect = selectedRect(); const draft = ensureDraft()
+  if (!rect || draft?.kind !== 'realmRaid' || !draft.realmRaid) { setStatus('error', '请先框选刷新按钮。'); return }
+  draft.realmRaid.refresh.action = rect
+  setStatus('success', '已设置九宫格刷新区域。')
+}
+
+function addOpponentAvailabilityFeature() {
+  const rect = selectedRect(); const draft = ensureDraft(); const opponents = draft?.realmRaid?.opponents
+  if (!rect || draft?.kind !== 'realmRaid' || !opponents?.length) { setStatus('error', '请先添加一个对手区域，再框选其可挑战标志。'); return }
+  void runOperation('activity', () => calibrateActivityFeature(rect), (feature) => {
+    opponents[opponents.length - 1]!.availableFeatures.push(feature)
+    setStatus('success', `已为第 ${opponents.length} 个对手添加可挑战特征。`)
+  })
+}
+
+function addRefreshAvailabilityFeature() {
+  const rect = selectedRect(); const draft = ensureDraft()
+  if (!rect || draft?.kind !== 'realmRaid' || !draft.realmRaid) { setStatus('error', '请在刷新可用时框选稳定标志。'); return }
+  void runOperation('activity', () => calibrateActivityFeature(rect), (feature) => {
+    draft.realmRaid!.refresh.features.push(feature)
+    setStatus('success', '已添加刷新可用特征。')
+  })
+}
+
+function addProgressRewardAction() {
+  const rect = selectedRect(); const draft = ensureDraft(); const rewards = draft?.realmRaid?.progressRewards
+  if (!rect || draft?.kind !== 'realmRaid' || !rewards) { setStatus('error', '请先框选进度奖励区域。'); return }
+  if (rewards.length >= 3) { setStatus('error', '3/6/9 三个奖励区域已经全部设置。'); return }
+  rewards.push({ action: rect, features: [] })
+  setStatus('success', `已添加第 ${rewards.length} 个进度奖励；请继续添加其可领取特征。`)
+}
+
+function addProgressRewardFeature() {
+  const rect = selectedRect(); const draft = ensureDraft(); const rewards = draft?.realmRaid?.progressRewards
+  if (!rect || draft?.kind !== 'realmRaid' || !rewards?.length) { setStatus('error', '请先添加一个进度奖励区域。'); return }
+  void runOperation('activity', () => calibrateActivityFeature(rect), (feature) => {
+    rewards[rewards.length - 1]!.features.push(feature)
+    setStatus('success', `已为第 ${rewards.length} 个进度奖励添加可领取特征。`)
+  })
+}
+
+function addAttackRequirement() {
+  const rect = selectedRect(); const draft = ensureDraft()
+  if (!rect || draft?.kind !== 'realmRaid' || !draft.realmRaid) { setStatus('error', '请在对手详情页框选进攻门禁特征。'); return }
+  void runOperation('activity', () => calibrateActivityFeature(rect), (feature) => {
+    draft.realmRaid!.attackRequirements.push(feature)
+    setStatus('success', `已添加第 ${draft.realmRaid!.attackRequirements.length} 项进攻门禁特征。`)
+  })
+}
+
+function addPauseCondition() {
+  const rect = selectedRect(); const draft = ensureDraft(); const name = popupName.value.trim()
+  if (!rect || draft?.kind !== 'realmRaid' || !draft.realmRaid || !name) { setStatus('error', '请输入暂停条件名称并框选稳定特征。'); return }
+  void runOperation('activity', () => calibrateActivityFeature(rect), (feature) => {
+    let condition = draft.realmRaid!.pauseConditions.find((item) => item.name === name)
+    if (!condition) { condition = { name, features: [] }; draft.realmRaid!.pauseConditions.push(condition) }
+    condition.features.push(feature)
+    setStatus('success', `已添加“${name}”安全暂停条件。`)
+  })
+}
+
 function addPopupFeature() {
   const rect = selectedRect(); const draft = ensureDraft(); const name = popupName.value.trim()
   if (!rect || !draft || !name) { setStatus('error', '请输入弹窗名称并框选稳定识别区域。'); return }
@@ -314,10 +409,10 @@ function handleConfigSelection() {
 function newCalibration() {
   draftConfig.value = null
   selectedConfigId.value = ''
-  activityName.value = '活动配置'
+  activityName.value = '结界突破'
   recognitionPreview.value = null
   if (imageSize.width && imageSize.height) ensureDraft()
-  setStatus('neutral', '已开始新配置；请按六个页面状态依次校准。')
+  setStatus('neutral', '已开始结界突破配置；请依次校准八个页面状态、九个对手区域和刷新按钮。')
 }
 
 function deleteCalibration() {
@@ -369,6 +464,10 @@ function scheduleActivityStep() {
 
 function handleStartActivity() {
   if (!selectedConfigId.value) { setStatus('error', '请先选择活动配置。'); return }
+  if (!Number.isInteger(Number(targetRuns.value)) || Number(targetRuns.value) < 1 || Number(targetRuns.value) > 30) {
+    setStatus('error', '目标成功次数必须是 1 到 30 的整数。')
+    return
+  }
   void runOperation('activity', () => startActivity(selectedConfigId.value, Number(targetRuns.value)), (session) => {
     appState.value.activitySession = session; resumePreview.value = null; scheduleActivityStep(); setStatus('success', '活动任务已开始。')
   })
@@ -955,7 +1054,7 @@ onBeforeUnmount(() => {
 
     <section class="panel activity-panel" aria-labelledby="activity-title">
       <div class="panel-header">
-        <div><h2 id="activity-title">活动校准与自动挑战</h2><p>仅操作当前活动设备；未知或歧义页面会安全暂停。</p></div>
+        <div><h2 id="activity-title">结界突破校准与自动挑战</h2><p>按成功结算计数，最多 30 次；失败不会增加完成次数。</p></div>
         <span class="version-badge">配置 v1</span>
       </div>
       <div class="activity-grid">
@@ -966,12 +1065,19 @@ onBeforeUnmount(() => {
           <button class="button secondary" type="button" :disabled="Boolean(busy)" @click="newCalibration">新建配置</button>
           <label for="calibration-state">当前页面</label>
           <select id="calibration-state" v-model="selectedCalibrationState">
-            <option v-for="(label, state) in pageLabels" :key="state" :value="state">{{ label }}</option>
+            <option v-for="state in calibrationStates" :key="state" :value="state">{{ pageLabels[state] }}</option>
           </select>
           <p class="safety-note">先刷新截图并框选稳定区域。特征只有 4×4 色彩统计，无法还原画面。</p>
           <div class="activity-actions">
             <button class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addCalibrationFeature">添加识别区域</button>
-            <button v-if="selectedCalibrationState !== 'battling'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="setCalibrationAction">设为动作区域</button>
+            <button v-if="selectedCalibrationState !== 'battling' && selectedCalibrationState !== 'challenge'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="setCalibrationAction">设为动作区域</button>
+            <button v-if="selectedCalibrationState === 'challenge' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addRealmRaidOpponentAction">添加对手区域</button>
+            <button v-if="selectedCalibrationState === 'challenge' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || !draftConfig.realmRaid?.opponents.length || Boolean(busy)" @click="addOpponentAvailabilityFeature">添加当前对手可挑战特征</button>
+            <button v-if="selectedCalibrationState === 'challenge' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="setRealmRaidRefreshAction">设为刷新区域</button>
+            <button v-if="selectedCalibrationState === 'challenge' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addRefreshAvailabilityFeature">添加刷新可用特征</button>
+            <button v-if="selectedCalibrationState === 'challenge' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addProgressRewardAction">添加 3/6/9 奖励区域</button>
+            <button v-if="selectedCalibrationState === 'challenge' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || !draftConfig.realmRaid?.progressRewards.length || Boolean(busy)" @click="addProgressRewardFeature">添加当前奖励可领取特征</button>
+            <button v-if="selectedCalibrationState === 'opponent' && draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addAttackRequirement">添加进攻门禁特征</button>
             <button class="button primary" type="button" :disabled="!draftConfig || Boolean(busy)" @click="saveCalibration">保存配置</button>
           </div>
           <div class="click-settings">
@@ -987,6 +1093,7 @@ onBeforeUnmount(() => {
             <button class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addPopupFeature">添加弹窗识别区域</button>
             <button class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="setPopupCloseAction">设为弹窗关闭区域</button>
             <button class="button secondary" type="button" :disabled="!draftConfig || Boolean(busy)" @click="applyPopupTimingOverride">应用弹窗时序覆盖</button>
+            <button v-if="draftConfig?.kind === 'realmRaid'" class="button secondary" type="button" :disabled="!selectedRect() || Boolean(busy)" @click="addPauseCondition">添加同名安全暂停条件</button>
           </div>
           <div v-if="draftConfig" class="click-settings">
             <label>全局延时下限<input v-model.number="draftConfig.clickDelay.minimumMs" type="number" min="0" /></label>
@@ -994,8 +1101,10 @@ onBeforeUnmount(() => {
             <label>全局按压下限<input v-model.number="draftConfig.pressDuration.minimumMs" type="number" min="1" /></label>
             <label>全局按压上限<input v-model.number="draftConfig.pressDuration.maximumMs" type="number" min="1" /></label>
           </div>
+          <label v-if="draftConfig?.kind === 'realmRaid' && draftConfig.realmRaid" for="failure-limit">连续失败暂停上限</label>
+          <input v-if="draftConfig?.kind === 'realmRaid' && draftConfig.realmRaid" id="failure-limit" v-model.number="draftConfig.realmRaid.failureLimit" type="number" min="1" max="9" step="1" />
           <ul v-if="draftConfig" class="calibration-summary">
-            <li v-for="profile in draftConfig.states" :key="profile.state">{{ pageLabels[profile.state] }}：{{ profile.features.length }} 个识别区域<span v-if="profile.state !== 'battling'"> · {{ profile.action ? '动作已设置' : '缺少动作' }}</span></li>
+            <li v-for="profile in draftConfig.states" :key="profile.state">{{ pageLabels[profile.state] }}：{{ profile.features.length }} 个识别区域<span v-if="profile.state === 'challenge' && draftConfig.kind === 'realmRaid'"> · {{ draftConfig.realmRaid?.opponents.length || 0 }} / 9 个对手（{{ draftConfig.realmRaid?.opponents.filter(item => item.availableFeatures.length).length || 0 }} 个已设可挑战特征） · {{ draftConfig.realmRaid?.refresh.features.length ? '刷新门禁已设置' : '缺少刷新门禁' }} · {{ draftConfig.realmRaid?.progressRewards.length || 0 }} / 3 个奖励</span><span v-else-if="profile.state === 'opponent' && draftConfig.kind === 'realmRaid'"> · {{ profile.action ? '进攻区域已设置' : '缺少进攻区域' }} · {{ draftConfig.realmRaid?.attackRequirements.length || 0 }} / 2+ 项门禁</span><span v-else-if="profile.state !== 'battling'"> · {{ profile.action ? '动作已设置' : '缺少动作' }}</span></li>
           </ul>
         </div>
         <div class="activity-card">
@@ -1014,7 +1123,9 @@ onBeforeUnmount(() => {
             <li>结果：{{ recognitionPreview.matchedState ? pageLabels[recognitionPreview.matchedState] : recognitionPreview.reason }}</li>
           </ul>
           <label for="target-runs">目标成功次数</label>
-          <input id="target-runs" v-model.number="targetRuns" type="number" min="1" />
+          <input id="target-runs" v-model.number="targetRuns" type="number" min="1" max="30" step="1" aria-describedby="target-runs-help target-runs-error" :aria-invalid="Boolean(targetRunsError)" />
+          <p id="target-runs-help" class="safety-note">按成功结算计数；失败不计次，挑战券持有上限为 30。</p>
+          <p v-if="targetRunsError" id="target-runs-error" class="field-error" role="alert">{{ targetRunsError }}</p>
           <dl class="frame-meta">
             <div><dt>任务状态</dt><dd>{{ appState.activitySession.status }}</dd></div>
             <div><dt>完成次数</dt><dd>{{ appState.activitySession.completedRuns }} / {{ appState.activitySession.targetRuns || targetRuns }}</dd></div>

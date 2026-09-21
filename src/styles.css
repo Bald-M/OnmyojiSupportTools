@@ -519,6 +519,13 @@ select:hover {
   line-height: 1.55;
 }
 
+.field-error {
+  margin: 6px 2px 0;
+  color: var(--error);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .status-bar {
   display: flex;
   align-items: center;

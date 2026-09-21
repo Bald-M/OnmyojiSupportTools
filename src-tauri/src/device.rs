@@ -19,8 +19,9 @@ use tokio::{
 };
 
 use crate::activity::{
-    ActivityConfig, ActivitySession, RecognitionResult, Rect as ActivityRect, TaskStatus,
-    VisualFeature, extract_feature, recognize, recognize_popup,
+    ActivityConfig, ActivityKind, ActivitySession, RecognitionResult, Rect as ActivityRect,
+    SafeAction, TaskStatus, VisualFeature, extract_feature, features_match, recognize,
+    recognize_popup,
 };
 use crate::click::{ClickTarget, FrameBounds, Point, sample_target};
 use crate::emulator_discovery::{LocalEmulatorDiscovery, SystemLocalEmulatorDiscovery};
@@ -1083,7 +1084,7 @@ impl DeviceManager {
         resumed.status = TaskStatus::Navigating;
         resumed.pause_reason = None;
         if resumed.current_state != Some(page) {
-            resumed.observe(page)?;
+            resumed.observe_for(config.kind, page)?;
         }
         let mut state = self.state.write().await;
         if state.activity_session.status != TaskStatus::Paused
@@ -1195,6 +1196,15 @@ impl DeviceManager {
             }
             return Ok(self.state.read().await.activity_session.clone());
         }
+        if let Some(realm_raid) = config.realm_raid.as_ref() {
+            for condition in &realm_raid.pause_conditions {
+                if features_match(&bytes, &condition.features, config.matching.threshold)? {
+                    return Ok(self
+                        .pause_activity(&format!("检测到安全暂停条件：{}", condition.name))
+                        .await);
+                }
+            }
+        }
         let recognition = recognize(&bytes, &config)?;
         let Some(page) = recognition.matched_state else {
             return Ok(self
@@ -1207,12 +1217,117 @@ impl DeviceManager {
                 .await);
         };
         let profile = config.states.iter().find(|profile| profile.state == page);
-        let action = profile.and_then(|profile| profile.action);
+        let (action, action_key) = if config.kind == ActivityKind::RealmRaid
+            && page == crate::activity::PageState::Challenge
+        {
+            let realm_raid = config
+                .realm_raid
+                .as_ref()
+                .expect("validated realm raid config");
+            let (attempted, failed) = {
+                let state = self.state.read().await;
+                (
+                    state.activity_session.attempted_opponents.clone(),
+                    state.activity_session.failed_opponents.clone(),
+                )
+            };
+            let mut available = None;
+            for (index, opponent) in realm_raid.opponents.iter().enumerate() {
+                if attempted.contains(&(index as u8)) {
+                    continue;
+                }
+                if features_match(
+                    &bytes,
+                    &opponent.available_features,
+                    config.matching.threshold,
+                )? {
+                    available = Some((index, opponent.action));
+                    break;
+                }
+            }
+            if let Some((index, action)) = available {
+                (Some(action), SafeAction::RealmRaidOpponent(index as u8))
+            } else {
+                if !attempted.is_empty() && failed.len() == attempted.len() {
+                    return Ok(self
+                        .pause_activity("本轮所有可挑战对手均失败，请检查阵容或手动刷新")
+                        .await);
+                }
+                let mut matching_rewards = Vec::new();
+                for (index, reward) in realm_raid.progress_rewards.iter().enumerate() {
+                    if features_match(&bytes, &reward.features, config.matching.threshold)? {
+                        matching_rewards.push((
+                            index,
+                            reward.action.expect("validated progress reward action"),
+                        ));
+                    }
+                }
+                if matching_rewards.len() > 1 {
+                    return Ok(self
+                        .pause_activity("多个进度奖励同时匹配，无法安全选择")
+                        .await);
+                }
+                if let Some((index, action)) = matching_rewards.first() {
+                    (
+                        Some(*action),
+                        SafeAction::RealmRaidProgressReward(*index as u8),
+                    )
+                } else if features_match(
+                    &bytes,
+                    &realm_raid.refresh.features,
+                    config.matching.threshold,
+                )? {
+                    (realm_raid.refresh.action, SafeAction::RealmRaidRefresh)
+                } else {
+                    return Ok(self
+                        .pause_activity("没有唯一可信的可挑战对手，且刷新当前不可用")
+                        .await);
+                }
+            }
+        } else if config.kind == ActivityKind::RealmRaid
+            && page == crate::activity::PageState::Opponent
+        {
+            let realm_raid = config
+                .realm_raid
+                .as_ref()
+                .expect("validated realm raid config");
+            if !features_match(
+                &bytes,
+                &realm_raid.attack_requirements,
+                config.matching.threshold,
+            )? {
+                return Ok(self
+                    .pause_activity("对手详情或消耗 1 未通过进攻前安全检查")
+                    .await);
+            }
+            (
+                profile.and_then(|profile| profile.action),
+                SafeAction::Page(page),
+            )
+        } else {
+            (
+                profile.and_then(|profile| profile.action),
+                SafeAction::Page(page),
+            )
+        };
         {
             let mut state = self.state.write().await;
             if state.activity_session.current_state != Some(page) {
-                if let Err(error) = state.activity_session.observe(page) {
+                if let Err(error) = state.activity_session.observe_for(config.kind, page) {
                     state.activity_session.pause(error.message);
+                }
+                if config.kind == ActivityKind::RealmRaid
+                    && page == crate::activity::PageState::Defeat
+                    && state.activity_session.consecutive_failures
+                        >= config
+                            .realm_raid
+                            .as_ref()
+                            .expect("validated realm raid config")
+                            .failure_limit
+                {
+                    state
+                        .activity_session
+                        .pause("连续失败达到安全上限，请检查阵容或对手");
                 }
                 state.handled_popups = 0;
                 state.activity_deadline = Some(
@@ -1230,7 +1345,7 @@ impl DeviceManager {
             ) {
                 return Ok(state.activity_session.clone());
             }
-            if state.activity_session.last_safe_action.as_deref() == Some(&format!("{:?}", page)) {
+            if state.activity_session.last_safe_action.as_ref() == Some(&action_key) {
                 return Ok(state.activity_session.clone());
             }
         }
@@ -1277,10 +1392,25 @@ impl DeviceManager {
             }
             let mut state = self.state.write().await;
             state.activity_session.retry_count = 0;
-            state.activity_session.last_safe_action = Some(format!("{:?}", page));
+            state.activity_session.last_safe_action = Some(action_key.clone());
+            if config.kind == ActivityKind::RealmRaid {
+                if action_key == SafeAction::RealmRaidRefresh {
+                    state.activity_session.attempted_opponents.clear();
+                    state.activity_session.failed_opponents.clear();
+                    state.activity_session.next_opponent_index = 0;
+                } else if let SafeAction::RealmRaidOpponent(index) = action_key {
+                    if !state.activity_session.attempted_opponents.contains(&index) {
+                        state.activity_session.attempted_opponents.push(index);
+                    }
+                    state.activity_session.next_opponent_index = index.saturating_add(1);
+                }
+            }
             if matches!(
                 page,
-                crate::activity::PageState::Challenge | crate::activity::PageState::ReturnChallenge
+                crate::activity::PageState::Challenge
+                    | crate::activity::PageState::ReturnChallenge
+                    | crate::activity::PageState::Opponent
+                    | crate::activity::PageState::BattleReady
             ) {
                 state.activity_session.status = TaskStatus::Starting;
             }
@@ -2032,8 +2162,9 @@ mod tests {
         validate_png,
     };
     use crate::activity::{
-        ActivityConfig, FrameSpec, KnownPopup, Orientation, PageState, Rect, TaskStatus,
-        TimingRange, extract_feature,
+        ActivityConfig, ActivityKind, FeatureAction, FrameSpec, KnownPopup, Orientation, PageState,
+        RealmRaidConfig, RealmRaidOpponent, RealmRaidPauseCondition, Rect, SafeAction,
+        StateProfile, TaskStatus, TimingRange, extract_feature,
     };
     use crate::preview::{PreviewBackend, PreviewEndSink, PreviewSessionHandle, PreviewSink};
 
@@ -2289,6 +2420,122 @@ mod tests {
                 height: 14,
             });
         }
+        config
+    }
+
+    fn realm_raid_config(pages: &[(PageState, Vec<u8>)]) -> ActivityConfig {
+        let mut config = ActivityConfig::example_for_test();
+        config.kind = ActivityKind::RealmRaid;
+        config.frame = FrameSpec {
+            width: 16,
+            height: 16,
+            orientation: Orientation::Landscape,
+        };
+        config.click_delay = TimingRange {
+            minimum_ms: 0,
+            maximum_ms: 0,
+        };
+        config.press_duration = TimingRange {
+            minimum_ms: 1,
+            maximum_ms: 1,
+        };
+        config.states = pages
+            .iter()
+            .enumerate()
+            .map(|(index, (state, png))| StateProfile {
+                state: *state,
+                features: vec![
+                    extract_feature(
+                        png,
+                        Rect {
+                            left: 0,
+                            top: 0,
+                            width: 16,
+                            height: 16,
+                        },
+                    )
+                    .unwrap(),
+                ],
+                action: (*state != PageState::Battling && *state != PageState::Challenge)
+                    .then_some(Rect {
+                        left: index as u32 + 1,
+                        top: 1,
+                        width: 1,
+                        height: 1,
+                    }),
+                click_delay: None,
+                press_duration: None,
+            })
+            .collect();
+        config.realm_raid = Some(RealmRaidConfig {
+            opponents: (0..9)
+                .map(|index| RealmRaidOpponent {
+                    available_features: config
+                        .states
+                        .iter()
+                        .find(|profile| profile.state == PageState::Challenge)
+                        .unwrap()
+                        .features
+                        .clone(),
+                    action: Rect {
+                        left: index + 1,
+                        top: 2,
+                        width: 1,
+                        height: 1,
+                    },
+                })
+                .collect(),
+            refresh: FeatureAction {
+                features: config
+                    .states
+                    .iter()
+                    .find(|profile| profile.state == PageState::Challenge)
+                    .unwrap()
+                    .features
+                    .clone(),
+                action: Some(Rect {
+                    left: 12,
+                    top: 12,
+                    width: 1,
+                    height: 1,
+                }),
+            },
+            progress_rewards: [
+                PageState::ActivityEntry,
+                PageState::StageEntry,
+                PageState::Reward,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| FeatureAction {
+                features: config
+                    .states
+                    .iter()
+                    .find(|profile| profile.state == state)
+                    .unwrap()
+                    .features
+                    .clone(),
+                action: Some(Rect {
+                    left: index as u32 + 1,
+                    top: 10,
+                    width: 1,
+                    height: 1,
+                }),
+            })
+            .collect(),
+            attack_requirements: vec![
+                config
+                    .states
+                    .iter()
+                    .find(|profile| profile.state == PageState::Opponent)
+                    .unwrap()
+                    .features[0]
+                    .clone();
+                2
+            ],
+            failure_limit: 3,
+            pause_conditions: vec![],
+        });
         config
     }
 
@@ -3310,7 +3557,10 @@ mod tests {
         assert_eq!(manager.advance_activity().await.unwrap().retry_count, 2);
         let recovered = manager.advance_activity().await.unwrap();
         assert_eq!(recovered.retry_count, 0);
-        assert_eq!(recovered.last_safe_action.as_deref(), Some("ActivityEntry"));
+        assert_eq!(
+            recovered.last_safe_action,
+            Some(SafeAction::Page(PageState::ActivityEntry))
+        );
         assert_eq!(
             runner
                 .calls()
@@ -3321,6 +3571,370 @@ mod tests {
             3
         );
         assert_eq!(runtime.sleeps().len(), 5); // three click delays and two backoffs
+    }
+
+    #[tokio::test]
+    async fn realm_raid_cycles_nine_opponents_before_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Opponent, solid_png([240, 120, 10])),
+            (PageState::BattleReady, solid_png([120, 240, 10])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::Defeat, solid_png([10, 240, 240])),
+        ];
+        let mut outputs = vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ];
+        for page in [&pages[0].1, &pages[1].1] {
+            outputs.push(success_bytes(page));
+            outputs.push(success(""));
+        }
+        for _ in 0..10 {
+            outputs.push(success_bytes(&pages[2].1));
+            outputs.push(success(""));
+        }
+        let runner = Arc::new(FakeRunner::with_outputs(outputs));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("realm-raid.json"), runner.clone());
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager
+            .save_activity_config(realm_raid_config(&pages))
+            .await
+            .unwrap();
+        manager.start_activity("config".into(), 30).await.unwrap();
+
+        for _ in 0..12 {
+            manager.advance_activity().await.unwrap();
+        }
+
+        let session = manager.state.read().await.activity_session.clone();
+        assert_eq!(session.next_opponent_index, 0);
+        assert_eq!(session.last_safe_action, Some(SafeAction::RealmRaidRefresh));
+        let taps: Vec<_> = runner
+            .calls()
+            .await
+            .into_iter()
+            .filter(|args| args.iter().any(|arg| arg == "swipe"))
+            .collect();
+        assert_eq!(taps.len(), 12);
+        for (index, tap) in taps[2..11].iter().enumerate() {
+            assert!(
+                tap.windows(2)
+                    .any(|pair| pair == ["swipe", &(index + 1).to_string()])
+            );
+        }
+        assert!(taps[11].iter().any(|value| value == "12"));
+    }
+
+    #[tokio::test]
+    async fn realm_raid_collects_a_progress_reward_after_exhausting_opponents() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Opponent, solid_png([240, 120, 10])),
+            (PageState::BattleReady, solid_png([120, 240, 10])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::Defeat, solid_png([10, 240, 240])),
+        ];
+        let mut config = realm_raid_config(&pages);
+        config.realm_raid.as_mut().unwrap().progress_rewards[0].features = config
+            .states
+            .iter()
+            .find(|profile| profile.state == PageState::Challenge)
+            .unwrap()
+            .features
+            .clone();
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&pages[0].1),
+            success(""),
+            success_bytes(&pages[1].1),
+            success(""),
+            success_bytes(&pages[2].1),
+            success(""),
+        ]));
+        let manager =
+            DeviceManager::with_runner(directory.path().join("realm-reward.json"), runner);
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        for _ in 0..2 {
+            manager.advance_activity().await.unwrap();
+        }
+        manager
+            .state
+            .write()
+            .await
+            .activity_session
+            .attempted_opponents = (0..9).collect();
+        manager.advance_activity().await.unwrap();
+        let session = manager.state.read().await.activity_session.clone();
+        assert_eq!(session.attempted_opponents, (0..9).collect::<Vec<_>>());
+        assert_eq!(
+            session.last_safe_action,
+            Some(SafeAction::RealmRaidProgressReward(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_raid_refuses_attack_without_cost_and_target_requirements() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Opponent, solid_png([240, 120, 10])),
+            (PageState::BattleReady, solid_png([120, 240, 10])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::Defeat, solid_png([10, 240, 240])),
+        ];
+        let mut config = realm_raid_config(&pages);
+        config.realm_raid.as_mut().unwrap().attack_requirements = config.states[config
+            .states
+            .iter()
+            .position(|profile| profile.state == PageState::ActivityEntry)
+            .unwrap()]
+        .features
+        .clone();
+        config
+            .realm_raid
+            .as_mut()
+            .unwrap()
+            .attack_requirements
+            .push(config.states[0].features[0].clone());
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&pages[0].1),
+            success(""),
+            success_bytes(&pages[1].1),
+            success(""),
+            success_bytes(&pages[2].1),
+            success(""),
+            success_bytes(&pages[3].1),
+        ]));
+        let manager = DeviceManager::with_runner(
+            directory.path().join("realm-attack-gate.json"),
+            runner.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        for _ in 0..4 {
+            manager.advance_activity().await.unwrap();
+        }
+        let session = manager.state.read().await.activity_session.clone();
+        assert_eq!(session.status, TaskStatus::Paused);
+        assert!(session.pause_reason.unwrap().message.contains("消耗 1"));
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_raid_pauses_before_tapping_when_a_configured_condition_matches() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Opponent, solid_png([240, 120, 10])),
+            (PageState::BattleReady, solid_png([120, 240, 10])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::Defeat, solid_png([10, 240, 240])),
+        ];
+        let mut config = realm_raid_config(&pages);
+        config
+            .realm_raid
+            .as_mut()
+            .unwrap()
+            .pause_conditions
+            .push(RealmRaidPauseCondition {
+                name: "突破券不足".into(),
+                features: config.states[0].features.clone(),
+            });
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&pages[0].1),
+        ]));
+        let manager = DeviceManager::with_runner(
+            directory.path().join("realm-pause-condition.json"),
+            runner.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        let session = manager.advance_activity().await.unwrap();
+
+        assert_eq!(session.status, TaskStatus::Paused);
+        assert!(session.pause_reason.unwrap().message.contains("突破券不足"));
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_raid_pauses_when_the_consecutive_failure_limit_is_reached() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Opponent, solid_png([240, 120, 10])),
+            (PageState::BattleReady, solid_png([120, 240, 10])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::Defeat, solid_png([10, 240, 240])),
+        ];
+        let mut config = realm_raid_config(&pages);
+        config.realm_raid.as_mut().unwrap().failure_limit = 1;
+        let mut outputs = vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+        ];
+        for page in [
+            &pages[0].1,
+            &pages[1].1,
+            &pages[2].1,
+            &pages[3].1,
+            &pages[4].1,
+        ] {
+            outputs.push(success_bytes(page));
+            outputs.push(success(""));
+        }
+        outputs.push(success_bytes(&pages[5].1));
+        outputs.push(success_bytes(&pages[7].1));
+        let runner = Arc::new(FakeRunner::with_outputs(outputs));
+        let manager = DeviceManager::with_runner(
+            directory.path().join("realm-failure-limit.json"),
+            runner.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+
+        for _ in 0..7 {
+            manager.advance_activity().await.unwrap();
+        }
+        let session = manager.state.read().await.activity_session.clone();
+
+        assert_eq!(session.status, TaskStatus::Paused);
+        assert_eq!(session.completed_runs, 0);
+        assert_eq!(session.consecutive_failures, 1);
+        assert!(session.pause_reason.unwrap().message.contains("连续失败"));
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_raid_pauses_when_every_available_opponent_in_the_round_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let adb_path = directory.path().join("adb.exe");
+        std::fs::write(&adb_path, []).unwrap();
+        let pages = vec![
+            (PageState::ActivityEntry, solid_png([240, 10, 10])),
+            (PageState::StageEntry, solid_png([10, 240, 10])),
+            (PageState::Challenge, solid_png([10, 10, 240])),
+            (PageState::Opponent, solid_png([240, 120, 10])),
+            (PageState::BattleReady, solid_png([120, 240, 10])),
+            (PageState::Battling, solid_png([240, 240, 10])),
+            (PageState::Reward, solid_png([240, 10, 240])),
+            (PageState::Defeat, solid_png([10, 240, 240])),
+        ];
+        let mut config = realm_raid_config(&pages);
+        let unavailable = config.states[0].features.clone();
+        for opponent in config
+            .realm_raid
+            .as_mut()
+            .unwrap()
+            .opponents
+            .iter_mut()
+            .skip(1)
+        {
+            opponent.available_features = unavailable.clone();
+        }
+        let runner = Arc::new(FakeRunner::with_outputs(vec![
+            success("Android Debug Bridge version 1.0.41\nVersion 35.0.2"),
+            success("List of devices attached\nemulator-5554 device model:MuMu_12\n"),
+            success_bytes(&pages[0].1),
+            success(""),
+            success_bytes(&pages[1].1),
+            success(""),
+            success_bytes(&pages[2].1),
+        ]));
+        let manager = DeviceManager::with_runner(
+            directory.path().join("realm-round-failed.json"),
+            runner.clone(),
+        );
+        manager.set_adb_path(adb_path).await.unwrap();
+        manager.save_activity_config(config).await.unwrap();
+        manager.start_activity("config".into(), 1).await.unwrap();
+        for _ in 0..2 {
+            manager.advance_activity().await.unwrap();
+        }
+        {
+            let mut state = manager.state.write().await;
+            state.activity_session.attempted_opponents = vec![0];
+            state.activity_session.failed_opponents = vec![0];
+        }
+
+        let session = manager.advance_activity().await.unwrap();
+
+        assert_eq!(session.status, TaskStatus::Paused);
+        assert!(session.pause_reason.unwrap().message.contains("本轮所有"));
+        assert_eq!(
+            runner
+                .calls()
+                .await
+                .iter()
+                .filter(|args| args.iter().any(|arg| arg == "swipe"))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]
