@@ -752,8 +752,8 @@ onBeforeUnmount(() => {
           @change="handleDeviceChange"
         >
           <option value="" disabled>{{ onlineDevices.length ? '选择在线设备' : '没有在线设备' }}</option>
-          <option v-for="device in appState.devices" :key="device.serial" :value="device.serial" :disabled="device.status !== 'online'">
-            {{ device.model || device.serial }} · {{ deviceStatusLabels[device.status] }}
+          <option v-for="device in onlineDevices" :key="device.serial" :value="device.serial">
+            {{ device.displayName }} · {{ deviceStatusLabels[device.status] }}
           </option>
         </select>
         <button

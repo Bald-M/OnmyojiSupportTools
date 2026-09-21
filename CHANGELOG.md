@@ -33,6 +33,7 @@
 
 ### Changed
 
+- 活动设备列表现在通过 MuMuManager 显示 MuMu 多开器实例名称，只保留在线可操作设备，并按 endpoint 去重；离线、未授权及 ADB 遗留条目不再占据选择列表。
 - 仓库从 Lerna/pnpm 多包结构扁平化为根目录 Vue `src/` 与 Rust `src-tauri/`。
 - 移除 Koa HTTP 后端和浏览器部署路径，所有设备能力改由受控 Tauri IPC 暴露。
 - 工程版本统一为 `0.1.0`，根包设为私有，许可证元数据统一为 MIT。

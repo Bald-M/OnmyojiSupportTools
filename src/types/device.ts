@@ -9,6 +9,7 @@ export interface AdbCandidate {
 
 export interface DeviceSummary {
   serial: string
+  displayName: string
   model: string | null
   status: DeviceStatus
   transport: string | null

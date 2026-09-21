@@ -26,6 +26,7 @@ const readyState: AppState = {
   devices: [
     {
       serial: '127.0.0.1:16384',
+      displayName: 'MuMu安卓设备',
       model: 'MuMu 12',
       status: 'online',
       transport: '1',
@@ -302,14 +303,15 @@ describe('desktop device workflow', () => {
     expect(wrapper.find('main').exists()).toBe(true)
   })
 
-  it('shows unavailable devices but keeps them and capture disabled', async () => {
+  it('does not show unavailable devices in the active-device selector', async () => {
     device.getAppAppState.mockResolvedValueOnce({
       ...readyState,
       activeDeviceSerial: null,
       devices: [
-        { serial: 'offline-device', model: null, status: 'offline', transport: '2' },
+        { serial: 'offline-device', displayName: 'offline-device', model: null, status: 'offline', transport: '2' },
         {
           serial: 'unauthorized-device',
+          displayName: 'unauthorized-device',
           model: null,
           status: 'unauthorized',
           transport: '3',
@@ -321,11 +323,24 @@ describe('desktop device workflow', () => {
     await flushPromises()
 
     const options = wrapper.findAll('#device-select option')
-    expect(options[1]?.text()).toContain('离线')
-    expect(options[1]?.attributes('disabled')).toBeDefined()
-    expect(options[2]?.text()).toContain('未授权')
-    expect(options[2]?.attributes('disabled')).toBeDefined()
+    expect(options).toHaveLength(1)
     expect(wrapper.get('[data-testid="capture-button"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('shows distinct MuMu instance names instead of duplicate Android models', async () => {
+    device.getAppAppState.mockResolvedValueOnce({
+      ...readyState,
+      devices: [
+        { ...readyState.devices[0]!, displayName: 'MuMu安卓设备' },
+        { ...readyState.devices[0]!, serial: '127.0.0.1:16416', displayName: '猫猫火鸡面01', transport: '2' },
+      ],
+    } satisfies AppState)
+
+    const wrapper = mount(App)
+    await flushPromises()
+
+    const options = wrapper.findAll('#device-select option').slice(1).map((option) => option.text())
+    expect(options).toEqual(['MuMu安卓设备 · 在线', '猫猫火鸡面01 · 在线'])
   })
 
   it('reports partial MuMu discovery failures without hiding discovered devices', async () => {
@@ -347,7 +362,7 @@ describe('desktop device workflow', () => {
   it.each([
     { label: 'zero', devices: [], activeDeviceSerial: null, expectedOptions: 1 },
     { label: 'one', devices: readyState.devices, activeDeviceSerial: readyState.devices[0]!.serial, expectedOptions: 2 },
-    { label: 'multiple', devices: [readyState.devices[0]!, { ...readyState.devices[0]!, serial: '127.0.0.1:16416', transport: '2' }], activeDeviceSerial: readyState.devices[0]!.serial, expectedOptions: 3 },
+    { label: 'multiple', devices: [readyState.devices[0]!, { ...readyState.devices[0]!, serial: '127.0.0.1:16416', displayName: 'MuMu · 127.0.0.1:16416', transport: '2' }], activeDeviceSerial: readyState.devices[0]!.serial, expectedOptions: 3 },
   ])('renders $label devices returned by refresh', async ({ devices, activeDeviceSerial, expectedOptions }) => {
     device.refreshDevices.mockResolvedValueOnce({ ...readyState, devices, activeDeviceSerial })
     const wrapper = mount(App)

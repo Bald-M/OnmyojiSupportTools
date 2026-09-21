@@ -6,14 +6,14 @@ use tokio::process::Command;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 #[cfg(target_os = "windows")]
-pub(crate) fn adb_command(program: &Path) -> Command {
+pub(crate) fn background_command(program: &Path) -> Command {
     let mut command = Command::new(program);
     command.creation_flags(CREATE_NO_WINDOW);
     command
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn adb_command(program: &Path) -> Command {
+pub(crate) fn background_command(program: &Path) -> Command {
     Command::new(program)
 }
 
