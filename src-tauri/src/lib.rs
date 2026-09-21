@@ -3,6 +3,7 @@ mod click;
 mod device;
 mod emulator_discovery;
 mod preview;
+mod process;
 
 use std::path::PathBuf;
 
