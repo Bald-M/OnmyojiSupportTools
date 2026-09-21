@@ -23,11 +23,13 @@ use crate::activity::{
     VisualFeature, extract_feature, recognize, recognize_popup,
 };
 use crate::click::{ClickTarget, FrameBounds, Point, sample_target};
-use crate::emulator_discovery::{LocalEmulatorDiscovery, SystemLocalEmulatorDiscovery};
+use crate::emulator_discovery::{
+    DiscoveredMuMuInstance, LocalEmulatorDiscovery, MuMuDiscovery, SystemLocalEmulatorDiscovery,
+};
 use crate::preview::{
     AdbScreenrecordPreviewBackend, PreviewBackend, PreviewController, PreviewEndSink, PreviewSink,
 };
-use crate::process::adb_command;
+use crate::process::background_command;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const ADB_TIMEOUT: Duration = Duration::from_secs(8);
@@ -85,6 +87,7 @@ pub enum AdbSource {
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSummary {
     pub serial: String,
+    pub display_name: String,
     pub model: Option<String>,
     pub status: DeviceStatus,
     pub transport: Option<String>,
@@ -242,7 +245,7 @@ impl CommandRunner for ProcessRunner {
         args: &[String],
         limit: Duration,
     ) -> Result<CommandOutput, AppError> {
-        let mut command = adb_command(program);
+        let mut command = background_command(program);
         command
             .args(args)
             .stdin(Stdio::null())
@@ -588,7 +591,7 @@ impl DeviceManager {
         let adb = self.selected_adb_path().await?;
         self.ensure_bundled_server(&adb).await?;
         let initial_devices = self.list_devices(&adb).await?;
-        let (attempted_discovery, warnings) = self
+        let (attempted_discovery, warnings, discovered_mumu) = self
             .connect_discovered_mumu_devices(&adb, &initial_devices)
             .await;
         let devices = if attempted_discovery {
@@ -596,6 +599,7 @@ impl DeviceManager {
         } else {
             initial_devices
         };
+        let devices = enrich_devices(devices, &discovered_mumu);
 
         let mut state = self.state.write().await;
         let previous = state.active_device_serial.clone();
@@ -644,19 +648,29 @@ impl DeviceManager {
         &self,
         adb: &Path,
         existing_devices: &[DeviceSummary],
-    ) -> (bool, Vec<String>) {
-        let ports = match self.emulator_discovery.discover_mumu_adb_ports() {
-            Ok(ports) => ports,
-            Err(error) => return (false, vec![format!("MuMu 自动发现失败：{error}")]),
+    ) -> (bool, Vec<String>, Vec<DiscoveredMuMuInstance>) {
+        let discovery = match self.emulator_discovery.discover_mumu_instances().await {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                return (
+                    false,
+                    vec![format!("MuMu 自动发现失败：{error}")],
+                    Vec::new(),
+                );
+            }
         };
+        let MuMuDiscovery {
+            instances,
+            mut warnings,
+        } = discovery;
         let existing: HashSet<_> = existing_devices
             .iter()
             .map(|device| device.serial.as_str())
             .collect();
         let mut seen_ports = HashSet::new();
         let mut attempted = false;
-        let mut warnings = Vec::new();
-        for port in ports {
+        for instance in &instances {
+            let port = instance.port;
             if !seen_ports.insert(port) {
                 continue;
             }
@@ -669,7 +683,7 @@ impl DeviceManager {
                 warnings.push(format!("MuMu {serial} 自动连接失败：{}", error.message));
             }
         }
-        (attempted, warnings)
+        (attempted, warnings, instances)
     }
 
     async fn connect_and_verify_mumu(&self, adb: &Path, serial: &str) -> Result<(), AppError> {
@@ -1827,10 +1841,43 @@ fn parse_devices(output: &str) -> Vec<DeviceSummary> {
 
             Some(DeviceSummary {
                 serial: serial.to_owned(),
+                display_name: model
+                    .as_ref()
+                    .map(|model| format!("{model} · {serial}"))
+                    .unwrap_or_else(|| serial.to_owned()),
                 model,
                 status,
                 transport,
             })
+        })
+        .collect()
+}
+
+fn enrich_devices(
+    devices: Vec<DeviceSummary>,
+    discovered_mumu: &[DiscoveredMuMuInstance],
+) -> Vec<DeviceSummary> {
+    let names: std::collections::HashMap<_, _> = discovered_mumu
+        .iter()
+        .map(|instance| {
+            (
+                format!("127.0.0.1:{}", instance.port),
+                instance.display_name.as_deref(),
+            )
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    devices
+        .into_iter()
+        .filter(|device| seen.insert(device.serial.clone()))
+        .map(|mut device| {
+            if let Some(name) = names.get(&device.serial) {
+                device.display_name = name
+                    .filter(|name| !name.trim().is_empty())
+                    .map(|name| (*name).to_owned())
+                    .unwrap_or_else(|| format!("MuMu · {}", device.serial));
+            }
+            device
         })
         .collect()
 }
@@ -2026,7 +2073,8 @@ mod tests {
     use super::{
         ActivityRuntime, AdbCandidate, AdbServerIdentity, AdbServerProbe, AdbServerStatusProto,
         AdbSource, AppError, BundledAdbDistribution, BundledAdbFile, CommandOutput, CommandRunner,
-        ConnectEndpoint, DeviceManager, LocalEmulatorDiscovery, Point,
+        ConnectEndpoint, DeviceManager, DeviceStatus, DeviceSummary, DiscoveredMuMuInstance,
+        LocalEmulatorDiscovery, MuMuDiscovery, Point, enrich_devices,
         ensure_bundled_server_port_available, ensure_success, parse_devices, parse_endpoint,
         query_adb_server_identity, select_initial_adb, strings, validate_bundled_adb_files,
         validate_png,
@@ -2167,12 +2215,16 @@ mod tests {
     }
 
     struct FakeEmulatorDiscovery {
-        result: Result<Vec<u16>, String>,
+        result: Result<Vec<DiscoveredMuMuInstance>, String>,
     }
 
+    #[async_trait]
     impl LocalEmulatorDiscovery for FakeEmulatorDiscovery {
-        fn discover_mumu_adb_ports(&self) -> Result<Vec<u16>, String> {
-            self.result.clone()
+        async fn discover_mumu_instances(&self) -> Result<MuMuDiscovery, String> {
+            self.result.clone().map(|instances| MuMuDiscovery {
+                instances,
+                warnings: Vec::new(),
+            })
         }
     }
 
@@ -2349,9 +2401,55 @@ mod tests {
         assert_eq!(devices.len(), 3);
         assert_eq!(devices[0].serial, "127.0.0.1:16384");
         assert_eq!(devices[0].model.as_deref(), Some("MuMu 12"));
+        assert_eq!(devices[0].display_name, "MuMu 12 · 127.0.0.1:16384");
         assert_eq!(devices[0].status.as_str(), "online");
         assert_eq!(devices[1].status.as_str(), "offline");
         assert_eq!(devices[2].status.as_str(), "unauthorized");
+    }
+
+    #[test]
+    fn device_enrichment_deduplicates_entries_and_applies_mumu_names_without_hiding_diagnostics() {
+        let devices = vec![
+            DeviceSummary {
+                serial: "127.0.0.1:16384".to_owned(),
+                display_name: "HBP AL00 · 127.0.0.1:16384".to_owned(),
+                model: Some("HBP AL00".to_owned()),
+                status: DeviceStatus::Online,
+                transport: Some("1".to_owned()),
+            },
+            DeviceSummary {
+                serial: "127.0.0.1:16384".to_owned(),
+                display_name: "duplicate".to_owned(),
+                model: Some("HBP AL00".to_owned()),
+                status: DeviceStatus::Online,
+                transport: Some("2".to_owned()),
+            },
+            DeviceSummary {
+                serial: "127.0.0.1:16416".to_owned(),
+                display_name: "LGE AN10 · 127.0.0.1:16416".to_owned(),
+                model: Some("HBP AL00".to_owned()),
+                status: DeviceStatus::Online,
+                transport: Some("3".to_owned()),
+            },
+            DeviceSummary {
+                serial: "127.0.0.1:24576".to_owned(),
+                display_name: "127.0.0.1:24576".to_owned(),
+                model: None,
+                status: DeviceStatus::Offline,
+                transport: Some("4".to_owned()),
+            },
+        ];
+        let instances = vec![
+            DiscoveredMuMuInstance::new(16384, Some("MuMu安卓设备".to_owned())),
+            DiscoveredMuMuInstance::new(16416, None),
+        ];
+
+        let enriched = enrich_devices(devices, &instances);
+
+        assert_eq!(enriched.len(), 3);
+        assert_eq!(enriched[0].display_name, "MuMu安卓设备");
+        assert_eq!(enriched[1].display_name, "MuMu · 127.0.0.1:16416");
+        assert_eq!(enriched[2].status, DeviceStatus::Offline);
     }
 
     #[test]
@@ -2744,7 +2842,11 @@ mod tests {
             ),
         ]));
         let discovery = Arc::new(FakeEmulatorDiscovery {
-            result: Ok(vec![16384, 16384, 16416]),
+            result: Ok(vec![
+                DiscoveredMuMuInstance::new(16384, Some("猫猫火鸡面01".to_owned())),
+                DiscoveredMuMuInstance::new(16384, Some("猫猫火鸡面01".to_owned())),
+                DiscoveredMuMuInstance::new(16416, Some("MuMu安卓设备".to_owned())),
+            ]),
         });
         let manager = DeviceManager::with_runner_and_emulator_discovery(
             directory.path().join("config.json"),
@@ -2756,6 +2858,7 @@ mod tests {
         let state = manager.snapshot().await;
 
         assert_eq!(state.devices.len(), 1);
+        assert_eq!(state.devices[0].display_name, "猫猫火鸡面01");
         assert_eq!(
             state.active_device_serial.as_deref(),
             Some("127.0.0.1:16384")
@@ -2826,7 +2929,7 @@ mod tests {
             directory.path().join("config.json"),
             runner.clone(),
             Arc::new(FakeEmulatorDiscovery {
-                result: Ok(vec![16384]),
+                result: Ok(vec![DiscoveredMuMuInstance::new(16384, None)]),
             }),
         );
 
