@@ -1,4 +1,28 @@
-use std::path::Path;
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+};
+
+use async_trait::async_trait;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiscoveredMuMuInstance {
+    pub port: u16,
+    pub display_name: Option<String>,
+}
+
+impl DiscoveredMuMuInstance {
+    pub(crate) fn new(port: u16, display_name: Option<String>) -> Self {
+        Self { port, display_name }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MuMuDiscovery {
+    pub instances: Vec<DiscoveredMuMuInstance>,
+    pub warnings: Vec<String>,
+}
 
 #[derive(Clone, Copy)]
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
@@ -8,16 +32,24 @@ struct LocalTcpListener {
     pid: u32,
 }
 
+#[async_trait]
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+trait MuMuManagerRunner: Send + Sync {
+    async fn query(&self, path: &Path, args: &[&str]) -> Result<Vec<u8>, String>;
+}
+
+#[async_trait]
 pub(crate) trait LocalEmulatorDiscovery: Send + Sync {
-    fn discover_mumu_adb_ports(&self) -> Result<Vec<u16>, String>;
+    async fn discover_mumu_instances(&self) -> Result<MuMuDiscovery, String>;
 }
 
 pub(crate) struct SystemLocalEmulatorDiscovery;
 
 #[cfg(not(target_os = "windows"))]
+#[async_trait]
 impl LocalEmulatorDiscovery for SystemLocalEmulatorDiscovery {
-    fn discover_mumu_adb_ports(&self) -> Result<Vec<u16>, String> {
-        Ok(Vec::new())
+    async fn discover_mumu_instances(&self) -> Result<MuMuDiscovery, String> {
+        Ok(MuMuDiscovery::default())
     }
 }
 
@@ -34,14 +66,12 @@ fn is_mumu_process(path: &Path) -> bool {
 }
 
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
-fn filter_mumu_ports(
+fn mumu_listeners(
     listeners: &[LocalTcpListener],
     mut process_path: impl FnMut(u32) -> Option<std::path::PathBuf>,
-) -> Vec<u16> {
-    use std::collections::{HashMap, HashSet};
-
+) -> Vec<(LocalTcpListener, PathBuf)> {
     let mut process_paths = HashMap::new();
-    let mut ports = HashSet::new();
+    let mut discovered = Vec::new();
     for listener in listeners {
         if listener.address != 0 && listener.address != u32::from_ne_bytes([127, 0, 0, 1]) {
             continue;
@@ -49,18 +79,131 @@ fn filter_mumu_ports(
         let path = process_paths
             .entry(listener.pid)
             .or_insert_with(|| process_path(listener.pid));
-        if path.as_ref().is_some_and(|path| is_mumu_process(path)) && listener.port != 0 {
-            ports.insert(listener.port);
+        if let Some(path) = path.as_ref().filter(|path| is_mumu_process(path)) {
+            discovered.push((*listener, path.clone()));
         }
     }
-    let mut ports: Vec<_> = ports.into_iter().collect();
-    ports.sort_unstable();
-    ports
+    discovered
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn discover_mumu_listener_fallback(
+    listeners: &[(LocalTcpListener, PathBuf)],
+) -> Vec<DiscoveredMuMuInstance> {
+    let ports: HashSet<_> = listeners
+        .iter()
+        .filter_map(|(listener, _)| (listener.port != 0).then_some(listener.port))
+        .collect();
+    let mut instances: Vec<_> = ports
+        .into_iter()
+        .map(|port| DiscoveredMuMuInstance::new(port, None))
+        .collect();
+    instances.sort_unstable_by_key(|instance| instance.port);
+    instances
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn mumu_manager_paths(
+    listeners: &[(LocalTcpListener, PathBuf)],
+    mut candidate_exists: impl FnMut(&Path) -> bool,
+) -> Vec<PathBuf> {
+    let mut seen_directories = HashSet::new();
+    let mut paths = HashSet::new();
+    for (_, process) in listeners {
+        let Some(directory) = process.parent() else {
+            continue;
+        };
+        if !seen_directories.insert(directory) {
+            continue;
+        }
+        for candidate in [
+            directory.join("MuMuManager.exe"),
+            directory.join("..").join("shell").join("MuMuManager.exe"),
+            directory.join("..").join("nx_main").join("MuMuManager.exe"),
+        ] {
+            if candidate_exists(&candidate) {
+                paths.insert(candidate);
+            }
+        }
+    }
+    let mut paths: Vec<_> = paths.into_iter().collect();
+    paths.sort_unstable();
+    paths
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+async fn discover_from_mumu_managers(
+    managers: &[PathBuf],
+    fallback: Vec<DiscoveredMuMuInstance>,
+    runner: &dyn MuMuManagerRunner,
+) -> MuMuDiscovery {
+    let mut warnings = Vec::new();
+    for manager in managers {
+        match runner.query(manager, &["info", "-v", "all"]).await {
+            Ok(output) => match parse_mumu_manager_info(&output) {
+                Ok(instances) if !instances.is_empty() || fallback.is_empty() => {
+                    return MuMuDiscovery {
+                        instances,
+                        warnings,
+                    };
+                }
+                Ok(_) => warnings.push(format!(
+                    "{} 未返回运行中的 MuMu 实例，已回退到端口发现",
+                    manager.display()
+                )),
+                Err(error) => warnings.push(format!("{}：{error}", manager.display())),
+            },
+            Err(error) => warnings.push(error),
+        }
+    }
+    MuMuDiscovery {
+        instances: fallback,
+        warnings,
+    }
+}
+
+#[derive(Deserialize)]
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+struct MuMuManagerInstance {
+    name: String,
+    adb_port: Option<u16>,
+    #[serde(default)]
+    is_process_started: bool,
+    #[serde(default)]
+    is_android_started: bool,
+}
+
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn parse_mumu_manager_info(bytes: &[u8]) -> Result<Vec<DiscoveredMuMuInstance>, String> {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    let instances: HashMap<String, MuMuManagerInstance> = serde_json::from_slice(bytes)
+        .map_err(|error| format!("MuMuManager 返回无效 JSON：{error}"))?;
+    let mut discovered: Vec<_> = instances
+        .into_values()
+        .filter(|instance| instance.is_process_started && instance.is_android_started)
+        .filter_map(|instance| {
+            instance
+                .adb_port
+                .map(|port| DiscoveredMuMuInstance::new(port, Some(instance.name)))
+        })
+        .collect();
+    discovered.sort_unstable_by_key(|instance| instance.port);
+    discovered.dedup_by_key(|instance| instance.port);
+    Ok(discovered)
 }
 
 #[cfg(target_os = "windows")]
 mod windows {
-    use std::{ffi::c_void, path::PathBuf};
+    use std::{
+        ffi::c_void,
+        path::{Path, PathBuf},
+        process::Stdio,
+    };
+
+    use async_trait::async_trait;
+    use tokio::time::timeout;
+
+    use crate::process::background_command;
 
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, NO_ERROR},
@@ -74,13 +217,42 @@ mod windows {
     };
 
     use super::{
-        LocalEmulatorDiscovery, LocalTcpListener, SystemLocalEmulatorDiscovery, filter_mumu_ports,
+        LocalEmulatorDiscovery, LocalTcpListener, MuMuDiscovery, MuMuManagerRunner,
+        SystemLocalEmulatorDiscovery, discover_from_mumu_managers, discover_mumu_listener_fallback,
+        mumu_listeners, mumu_manager_paths,
     };
 
+    struct SystemMuMuManagerRunner;
+
+    #[async_trait]
+    impl MuMuManagerRunner for SystemMuMuManagerRunner {
+        async fn query(&self, path: &std::path::Path, args: &[&str]) -> Result<Vec<u8>, String> {
+            let mut command = background_command(path);
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let output = timeout(std::time::Duration::from_secs(8), command.output())
+                .await
+                .map_err(|_| format!("{} 查询超时", path.display()))?
+                .map_err(|error| format!("无法启动 {}：{error}", path.display()))?;
+            if !output.status.success() {
+                return Err(format!("{} 查询失败", path.display()));
+            }
+            Ok(output.stdout)
+        }
+    }
+
+    #[async_trait]
     impl LocalEmulatorDiscovery for SystemLocalEmulatorDiscovery {
-        fn discover_mumu_adb_ports(&self) -> Result<Vec<u16>, String> {
+        async fn discover_mumu_instances(&self) -> Result<MuMuDiscovery, String> {
             let listeners = tcp_listeners()?;
-            Ok(filter_mumu_ports(&listeners, process_path))
+            let mumu_listeners = mumu_listeners(&listeners, process_path);
+            let fallback = discover_mumu_listener_fallback(&mumu_listeners);
+            let managers = mumu_manager_paths(&mumu_listeners, Path::is_file);
+            Ok(discover_from_mumu_managers(&managers, fallback, &SystemMuMuManagerRunner).await)
         }
     }
 
@@ -167,11 +339,35 @@ mod windows {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        collections::HashMap,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
 
-    use std::{collections::HashMap, path::PathBuf};
+    use async_trait::async_trait;
 
-    use super::{LocalTcpListener, filter_mumu_ports, is_mumu_process};
+    use super::{
+        DiscoveredMuMuInstance, LocalTcpListener, MuMuManagerRunner, discover_from_mumu_managers,
+        discover_mumu_listener_fallback, is_mumu_process, mumu_listeners, mumu_manager_paths,
+        parse_mumu_manager_info,
+    };
+
+    struct FakeManagerRunner {
+        results: Mutex<Vec<Result<Vec<u8>, String>>>,
+        calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
+    }
+
+    #[async_trait]
+    impl MuMuManagerRunner for FakeManagerRunner {
+        async fn query(&self, path: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+            self.calls.lock().unwrap().push((
+                path.to_owned(),
+                args.iter().map(|arg| (*arg).to_owned()).collect(),
+            ));
+            self.results.lock().unwrap().remove(0)
+        }
+    }
 
     #[test]
     fn recognizes_only_mumu_or_nemu_executables_in_vendor_paths() {
@@ -229,8 +425,129 @@ mod tests {
             (12, PathBuf::from(r"C:\Windows\System32\other.exe")),
         ]);
 
-        let ports = filter_mumu_ports(&listeners, |pid| paths.get(&pid).cloned());
+        let listeners = mumu_listeners(&listeners, |pid| paths.get(&pid).cloned());
+        let instances = discover_mumu_listener_fallback(&listeners);
 
-        assert_eq!(ports, vec![16384, 16416]);
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].port, 16384);
+        assert_eq!(instances[0].display_name, None);
+        assert_eq!(instances[1].port, 16416);
+        assert_eq!(instances[1].display_name, None);
+    }
+
+    #[test]
+    fn parses_only_running_android_instances_from_mumu_manager_info() {
+        let output = r#"{
+            "0": {"name":"MuMu安卓设备","adb_port":16384,"is_process_started":true,"is_android_started":true},
+            "1": {"name":"未开机","is_process_started":false,"is_android_started":false},
+            "3": {"name":"猫猫火鸡面01","adb_port":16480,"is_process_started":true,"is_android_started":true},
+            "4": {"name":"启动中","adb_port":16512,"is_process_started":true,"is_android_started":false}
+        }"#;
+
+        let instances = parse_mumu_manager_info(output.as_bytes()).unwrap();
+
+        assert_eq!(
+            instances,
+            vec![
+                super::DiscoveredMuMuInstance::new(16384, Some("MuMu安卓设备".to_owned())),
+                super::DiscoveredMuMuInstance::new(16480, Some("猫猫火鸡面01".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_existing_manager_candidates_once_in_stable_order() {
+        let listeners = vec![
+            (
+                LocalTcpListener {
+                    address: 0,
+                    port: 1,
+                    pid: 10,
+                },
+                PathBuf::from(r"C:\MuMu\shell\player.exe"),
+            ),
+            (
+                LocalTcpListener {
+                    address: 0,
+                    port: 2,
+                    pid: 10,
+                },
+                PathBuf::from(r"C:\MuMu\shell\player.exe"),
+            ),
+        ];
+
+        let paths = mumu_manager_paths(&listeners, |path| {
+            path.ends_with("MuMuManager.exe") && !path.to_string_lossy().contains("nx_main")
+        });
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn manager_query_uses_documented_args_and_returns_named_instances() {
+        let runner = FakeManagerRunner {
+            results: Mutex::new(vec![Ok(r#"{"0":{"name":"猫猫火鸡面01","adb_port":16384,"is_process_started":true,"is_android_started":true}}"#.as_bytes().to_vec())]),
+            calls: Mutex::new(Vec::new()),
+        };
+        let manager = PathBuf::from(r"C:\MuMu\MuMuManager.exe");
+
+        let discovery =
+            discover_from_mumu_managers(std::slice::from_ref(&manager), Vec::new(), &runner).await;
+
+        assert_eq!(
+            discovery.instances,
+            vec![DiscoveredMuMuInstance::new(
+                16384,
+                Some("猫猫火鸡面01".to_owned())
+            )]
+        );
+        assert!(discovery.warnings.is_empty());
+        assert_eq!(
+            runner.calls.into_inner().unwrap(),
+            vec![(
+                manager,
+                vec!["info".to_owned(), "-v".to_owned(), "all".to_owned()]
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_failures_and_invalid_output_warn_then_fall_back() {
+        let runner = FakeManagerRunner {
+            results: Mutex::new(vec![Err("查询超时".to_owned()), Ok(b"not json".to_vec())]),
+            calls: Mutex::new(Vec::new()),
+        };
+        let fallback = vec![DiscoveredMuMuInstance::new(16384, None)];
+
+        let discovery = discover_from_mumu_managers(
+            &[PathBuf::from("first.exe"), PathBuf::from("second.exe")],
+            fallback.clone(),
+            &runner,
+        )
+        .await;
+
+        assert_eq!(discovery.instances, fallback);
+        assert_eq!(discovery.warnings.len(), 2);
+        assert!(discovery.warnings[0].contains("查询超时"));
+        assert!(discovery.warnings[1].contains("无效 JSON"));
+        assert_eq!(runner.calls.into_inner().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_manager_result_warns_and_uses_listener_fallback() {
+        let runner = FakeManagerRunner {
+            results: Mutex::new(vec![Ok(b"{}".to_vec())]),
+            calls: Mutex::new(Vec::new()),
+        };
+        let fallback = vec![DiscoveredMuMuInstance::new(16416, None)];
+
+        let discovery =
+            discover_from_mumu_managers(&[PathBuf::from("manager.exe")], fallback.clone(), &runner)
+                .await;
+
+        assert_eq!(discovery.instances, fallback);
+        assert_eq!(discovery.warnings.len(), 1);
+        assert!(discovery.warnings[0].contains("未返回运行中的 MuMu 实例"));
     }
 }

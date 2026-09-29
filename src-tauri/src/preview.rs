@@ -17,7 +17,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{device::AppError, process::adb_command};
+use crate::{device::AppError, process::background_command};
 
 pub(crate) type PreviewSink = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 pub(crate) type PreviewEndSink = Arc<dyn Fn(PreviewEnd) + Send + Sync>;
@@ -148,7 +148,7 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
         on_end: PreviewEndSink,
         live: Arc<AtomicBool>,
     ) -> Result<Box<dyn PreviewSessionHandle>, AppError> {
-        let mut command = adb_command(program);
+        let mut command = background_command(program);
         command
             .args(args)
             .stdin(Stdio::null())
