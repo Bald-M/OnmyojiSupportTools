@@ -5,7 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{device::AppError, process::background_command};
+use crate::{device::AppError, diagnostics, process::background_command};
 
 pub(crate) type PreviewSink = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
 pub(crate) type PreviewEndSink = Arc<dyn Fn(PreviewEnd) + Send + Sync>;
@@ -148,6 +148,9 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
         on_end: PreviewEndSink,
         live: Arc<AtomicBool>,
     ) -> Result<Box<dyn PreviewSessionHandle>, AppError> {
+        let trace_id = diagnostics::current_trace_id();
+        let started = Instant::now();
+        diagnostics::record("preview_process", "start", None, None);
         let mut command = background_command(program);
         command
             .args(args)
@@ -156,6 +159,12 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command.spawn().map_err(|error| {
+            diagnostics::record(
+                "preview_process",
+                "failure",
+                Some("PREVIEW_START_FAILED"),
+                Some(started.elapsed()),
+            );
             AppError::new(
                 "PREVIEW_START_FAILED",
                 format!("无法启动实时预览原型：{error}"),
@@ -163,6 +172,12 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
             )
         })?;
         let mut stdout = child.stdout.take().ok_or_else(|| {
+            diagnostics::record(
+                "preview_process",
+                "failure",
+                Some("PREVIEW_START_FAILED"),
+                Some(started.elapsed()),
+            );
             AppError::new(
                 "PREVIEW_START_FAILED",
                 "无法读取实时预览视频流",
@@ -170,6 +185,12 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
             )
         })?;
         let stderr = child.stderr.take().ok_or_else(|| {
+            diagnostics::record(
+                "preview_process",
+                "failure",
+                Some("PREVIEW_START_FAILED"),
+                Some(started.elapsed()),
+            );
             AppError::new(
                 "PREVIEW_START_FAILED",
                 "无法读取实时预览诊断信息",
@@ -193,10 +214,18 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
                 }
                 (StreamEnd::Eof, _) => PreviewEndCode::StreamEof,
             };
+            let exit_code = status.as_ref().and_then(|status| status.code());
+            let stable_code = match code {
+                PreviewEndCode::StreamEof => "PREVIEW_STREAM_EOF",
+                PreviewEndCode::ReadFailed => "PREVIEW_READ_FAILED",
+                PreviewEndCode::StreamStalled => "PREVIEW_STREAM_STALLED",
+                PreviewEndCode::ProcessExited => "PREVIEW_PROCESS_EXITED",
+            };
+            diagnostics::preview_end(trace_id, stable_code, exit_code, &stderr, started.elapsed());
             live.store(false, Ordering::Release);
             on_end(PreviewEnd {
                 code,
-                exit_code: status.and_then(|status| status.code()),
+                exit_code,
                 first_chunk_at: stream.first_chunk_at,
                 last_chunk_at: stream.last_chunk_at,
                 stderr: (!stderr.is_empty())
@@ -204,6 +233,7 @@ impl PreviewBackend for AdbScreenrecordPreviewBackend {
             });
         });
 
+        diagnostics::record("preview_process", "success", None, Some(started.elapsed()));
         Ok(Box::new(ProcessPreviewSession { task }))
     }
 }

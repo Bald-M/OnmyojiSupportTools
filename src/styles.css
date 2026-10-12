@@ -154,7 +154,6 @@ select:focus-visible,
 }
 
 .version-badge {
-  margin-left: auto;
   padding: 5px 9px;
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -162,6 +161,20 @@ select:focus-visible,
   background: var(--surface-muted);
   font-size: 11px;
   font-weight: 600;
+}
+
+.diagnostics-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: var(--error);
+  font-size: 12px;
+}
+
+.diagnostics-actions .button {
+  padding: 7px 9px;
+  white-space: nowrap;
 }
 
 .device-toolbar {

@@ -1,5 +1,6 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { save } from '@tauri-apps/plugin-dialog'
 
 import App from './App.vue'
 import type { ActivityConfig, AppState, PageState } from './types/device'
@@ -14,11 +15,12 @@ const device = vi.hoisted(() => ({
   tapScreen: vi.fn(),
   startPreview: vi.fn(),
   stopPreview: vi.fn(),
+  diagnosticsStatus: vi.fn(), openDiagnosticsDirectory: vi.fn(), exportDiagnostics: vi.fn(), reportPreviewError: vi.fn(),
   setClickSettings: vi.fn(), cancelPendingClick: vi.fn(), saveActivityConfig: vi.fn(), deleteActivityConfig: vi.fn(), calibrateActivityFeature: vi.fn(), previewActivityRecognition: vi.fn(), startActivity: vi.fn(), pauseActivity: vi.fn(), resumeActivity: vi.fn(), stopActivity: vi.fn(), advanceActivity: vi.fn(),
 }))
 
 vi.mock('./lib/device', () => device)
-vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }))
+vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn(), save: vi.fn() }))
 
 const readyState: AppState = {
   adbCandidates: [{ path: 'C:\\adb.exe', source: 'manual', version: '35.0.2' }],
@@ -61,6 +63,7 @@ describe('desktop device workflow', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     device.getAppAppState.mockResolvedValue(readyState)
+    device.diagnosticsStatus.mockResolvedValue(true)
     device.captureScreen.mockResolvedValue(new Uint8Array([137, 80, 78, 71]))
     device.tapScreen.mockResolvedValue({
       deviceSerial: '127.0.0.1:16384',
@@ -650,5 +653,42 @@ describe('desktop device workflow', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('opens the diagnostics directory and exports only after a privacy prompt', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(save).mockResolvedValue('C:\\safe\\diagnostics.jsonl')
+    device.openDiagnosticsDirectory.mockResolvedValue(undefined)
+    device.exportDiagnostics.mockResolvedValue(undefined)
+    const wrapper = mount(App)
+    await flushPromises()
+
+    await wrapper.findAll('button').find((button) => button.text() === '打开日志目录')!.trigger('click')
+    expect(device.openDiagnosticsDirectory).toHaveBeenCalledOnce()
+    await wrapper.findAll('button').find((button) => button.text() === '导出诊断日志')!.trigger('click')
+    await flushPromises()
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('分享前仍请检查'))
+    expect(device.exportDiagnostics).toHaveBeenCalledWith('C:\\safe\\diagnostics.jsonl')
+    expect(wrapper.get('.status-bar').text()).toContain('已导出')
+  })
+
+  it('keeps diagnostics unchanged when export is cancelled', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    vi.mocked(save).mockResolvedValue(null)
+    const wrapper = mount(App)
+    await flushPromises()
+    await wrapper.findAll('button').find((button) => button.text() === '导出诊断日志')!.trigger('click')
+    await flushPromises()
+    expect(device.exportDiagnostics).not.toHaveBeenCalled()
+    expect(wrapper.get('.status-bar').text()).toContain('设备环境已就绪')
+  })
+
+  it('shows a safe fallback when the log directory is unavailable', async () => {
+    device.diagnosticsStatus.mockResolvedValue(false)
+    const wrapper = mount(App)
+    await flushPromises()
+    expect(wrapper.text()).toContain('诊断日志不可用；设备功能仍可使用')
+    expect(wrapper.findAll('button').find((button) => button.text() === '导出诊断日志')!.attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="capture-button"]').attributes('disabled')).toBeUndefined()
   })
 })
