@@ -253,7 +253,7 @@ fn unavailable() -> AppError {
     AppError::new(
         "DIAGNOSTICS_UNAVAILABLE",
         "诊断日志不可用",
-        "请检查应用日志目录权限后重启应用",
+        "请检查程序目录下 log 文件夹的写入权限后重启应用",
     )
 }
 

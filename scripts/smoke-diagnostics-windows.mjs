@@ -11,15 +11,10 @@ if (process.platform !== 'win32' || process.arch !== 'x64') {
   throw new Error('The Release diagnostics smoke test requires Windows x64')
 }
 
-const localAppData = process.env.LOCALAPPDATA
-if (!localAppData) {
-  throw new Error('LOCALAPPDATA is unavailable')
-}
-
 const binary = path.resolve('src-tauri/target/x86_64-pc-windows-msvc/release/onmyoji-support-tools.exe')
-const logPath = path.join(localAppData, tauriConfig.identifier, 'logs', 'diagnostics.jsonl')
+const logPath = path.join(path.dirname(binary), 'log', 'diagnostics.jsonl')
 const startedAt = Date.now()
-const app = spawn(binary, [], { cwd: path.dirname(binary), stdio: 'ignore', windowsHide: true })
+const app = spawn(binary, [], { cwd: process.cwd(), stdio: 'ignore', windowsHide: true })
 let spawnError
 app.once('error', (error) => { spawnError = error })
 
@@ -54,14 +49,14 @@ try {
         || !/^[0-9a-f]{32}$/.test(startup.sessionId)) {
         throw new Error('Release startup log is missing expected version, platform, architecture, or session ID')
       }
-      console.log('Verified Windows x64 Release startup log in the Tauri app log directory')
+      console.log('Verified Windows x64 Release startup log beside the executable')
       verified = true
       break
     }
     await delay(500)
   }
   if (!verified) {
-    throw new Error('Release startup log did not appear in the Tauri app log directory')
+    throw new Error('Release startup log did not appear beside the executable')
   }
 } finally {
   if (app.exitCode === null && app.signalCode === null) app.kill()

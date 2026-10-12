@@ -290,8 +290,10 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            if let Ok(log_dir) = app.path().app_log_dir() {
-                diagnostics::initialize(log_dir);
+            if let Ok(executable) = std::env::current_exe()
+                && let Some(install_dir) = executable.parent()
+            {
+                diagnostics::initialize(install_dir.join("log"));
             }
             let config_path = app.path().app_config_dir()?.join("config.json");
             let bundled_adb_path = if cfg!(target_os = "windows") {
