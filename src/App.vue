@@ -12,7 +12,7 @@ import {
   Square,
   Move,
 } from '@lucide/vue'
-import { open } from '@tauri-apps/plugin-dialog'
+import { open, save } from '@tauri-apps/plugin-dialog'
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef } from 'vue'
 
 import { calculateContainedImageRect, mapClientPointToImage } from './lib/coordinates'
@@ -37,6 +37,10 @@ import {
   stopActivity,
   setClickSettings,
   deleteActivityConfig,
+  diagnosticsStatus,
+  openDiagnosticsDirectory,
+  exportDiagnostics,
+  reportPreviewError,
   type PreviewEnd,
 } from './lib/device'
 import { H264CanvasDecoder } from './lib/h264'
@@ -61,6 +65,8 @@ const emptyState: AppState = {
 
 const appState = ref<AppState>(emptyState)
 const busy = ref<Operation | null>('initialize')
+const diagnosticsAvailable = ref<boolean | null>(null)
+const diagnosticsBusy = ref(false)
 const screenshotUrl = shallowRef<string | null>(null)
 const screenshotStage = ref<HTMLElement | null>(null)
 const previewCanvas = ref<HTMLCanvasElement | null>(null)
@@ -210,6 +216,14 @@ function normalizeError(error: unknown): AppError {
   }
 }
 
+async function refreshDiagnosticsAvailability() {
+  try {
+    diagnosticsAvailable.value = await diagnosticsStatus()
+  } catch {
+    diagnosticsAvailable.value = false
+  }
+}
+
 async function runOperation<T>(
   operation: Operation,
   task: () => Promise<T>,
@@ -224,6 +238,7 @@ async function runOperation<T>(
     setStatus('error', appError.message, appError.recovery ?? null)
   } finally {
     busy.value = null
+    void refreshDiagnosticsAvailability()
   }
 }
 
@@ -525,6 +540,7 @@ function applyState(nextState: AppState) {
 }
 
 async function initialize() {
+  await refreshDiagnosticsAvailability()
   try {
     const state = await getAppAppState()
     applyState(state)
@@ -540,6 +556,32 @@ async function initialize() {
     setStatus('error', appError.message, appError.recovery ?? null)
   } finally {
     busy.value = null
+    void refreshDiagnosticsAvailability()
+  }
+}
+
+async function handleOpenDiagnostics() {
+  try {
+    await openDiagnosticsDirectory()
+  } catch (error) {
+    const appError = normalizeError(error)
+    setStatus('error', appError.message, appError.recovery ?? null)
+  }
+}
+
+async function handleExportDiagnostics() {
+  if (!window.confirm('诊断日志已脱敏，但分享前仍请检查内容。是否继续导出？')) return
+  diagnosticsBusy.value = true
+  try {
+    const path = await save({ defaultPath: 'onmyoji-diagnostics.jsonl', filters: [{ name: '诊断日志', extensions: ['jsonl'] }] })
+    if (!path) return
+    await exportDiagnostics(path)
+    setStatus('success', '诊断日志已导出。分享前请再次检查内容。')
+  } catch (error) {
+    const appError = normalizeError(error)
+    setStatus('error', appError.message, appError.recovery ?? null)
+  } finally {
+    diagnosticsBusy.value = false
   }
 }
 
@@ -628,7 +670,7 @@ function handlePreviewChunk(chunk: Uint8Array) {
   try {
     previewDecoder ??= new H264CanvasDecoder(
       previewCanvas.value,
-      (error) => { void recoverFromPreviewFailure(`实时预览解码失败：${error.message}`) },
+      (error) => { reportPreviewError(); void recoverFromPreviewFailure(`实时预览解码失败：${error.message}`) },
       (averageFps, frameCount) => {
         previewAverageFps.value = averageFps
         previewFrameCount.value = frameCount
@@ -636,6 +678,7 @@ function handlePreviewChunk(chunk: Uint8Array) {
     )
     previewDecoder.push(chunk)
   } catch (error) {
+    reportPreviewError()
     const message = error instanceof Error ? error.message : '实时预览解码失败'
     void recoverFromPreviewFailure(message)
   }
@@ -828,7 +871,12 @@ onBeforeUnmount(() => {
         <h1>OnmyojiSupportTools</h1>
         <p>Android 模拟器坐标调试工具</p>
       </div>
-      <span class="version-badge">0.1.0 · 开发版</span>
+      <div class="diagnostics-actions" aria-label="诊断日志">
+        <span v-if="diagnosticsAvailable === false" role="status">诊断日志不可用；设备功能仍可使用</span>
+        <button class="button secondary" type="button" :disabled="!diagnosticsAvailable || diagnosticsBusy" @click="handleOpenDiagnostics">打开日志目录</button>
+        <button class="button secondary" type="button" :disabled="!diagnosticsAvailable || diagnosticsBusy" @click="handleExportDiagnostics">导出诊断日志</button>
+        <span class="version-badge">0.1.0 · 开发版</span>
+      </div>
     </header>
 
     <section class="device-toolbar" aria-label="设备连接">

@@ -49,6 +49,12 @@ macOS 目前不提供原生应用或运行支持，但开发机可以交叉编�
 
 也可点击“实时预览（原型）”验证连续画面。此路径临时使用 Android `screenrecord` 输出的 H.264 Annex-B 流和 WebView2 WebCodecs，默认录制时长及编码能力受设备实现限制；停止后可立即重新开始。预览时显示实际绘制帧数及从首帧开始计算的累计平均 FPS，便于记录播放端帧率。连续 8 秒没有码流数据、读取失败、自然结束或进程异常退出会分别显示诊断信息，并回到“刷新截图”。Windows 实测方法与结果表见 [Issue #4 实时预览原型](docs/prototypes/issue-4-live-preview.md)。
 
+### 诊断日志
+
+应用启动后默认在程序可执行文件所在目录的 `log/` 下写入 `diagnostics.jsonl`。窗口右上角可打开该目录或将当前轮转文件导出为一个 `.jsonl` 文件；导出前会提醒检查内容，取消导出不会改动日志。若程序目录不可写，界面会提示诊断日志不可用，设备操作仍可继续。
+
+每条记录包含运行会话和单次操作的关联 ID、步骤及结果；关键步骤记录耗时，失败时附稳定错误码和固定恢复建议。ADB 记录命令类别、超时、退出码和经过保守脱敏及截断的文本摘要；不会写入完整设备序列号、IP、用户目录、ADB 路径、配置、截图或视频字节。单个日志文件最多 1 MiB，最多保留 3 个文件。分享导出文件前仍请自行检查并删除不愿公开的信息；应用不会自动上传日志。
+
 ## 本地开发
 
 通用开发环境需要 Node.js 22.12 或更高版本、pnpm 11.19 和 Rust stable。Windows 原生打包需要 Visual Studio C++ Build Tools 和 WebView2 开发环境。
@@ -97,13 +103,14 @@ src-tauri/src/device.rs DeviceManager：ADB、设备、截图、点击、识别�
 src-tauri/src/activity.rs 活动配置、不可逆特征识别与任务状态转换
 src-tauri/src/click.rs   单点/矩形随机落点策略
 src-tauri/src/lib.rs    受控 Tauri IPC 命令
+src-tauri/src/diagnostics.rs 本地结构化诊断日志与轮转
 docs/adr/               架构决策记录
 .github/                CI、Issue Form 与 PR 模板
 ```
 
 `DeviceManager` 是设备域的唯一入口。Vue 只通过 `src-tauri/src/lib.rs` 注册的 Tauri 命令校准和控制；页面识别、重试、截止时间、任务计数、随机点击及取消均由 Rust 决定。截图与原型视频块均以二进制 IPC 传输，不做 Base64。
 
-领域术语见 [CONTEXT.md](CONTEXT.md)，桌面架构见 [ADR-0001](docs/adr/0001-rust-tauri-desktop.md)，内置 ADB 的来源、隔离和升级取舍见 [ADR-0002](docs/adr/0002-bundle-auditable-adb.md)，实时预览原型边界见 [ADR-0003](docs/adr/0003-prototype-webview2-h264-preview.md)，活动任务所有权见 [ADR-0004](docs/adr/0004-device-manager-owns-activity-runtime.md)。
+领域术语见 [CONTEXT.md](CONTEXT.md)，桌面架构见 [ADR-0001](docs/adr/0001-rust-tauri-desktop.md)，内置 ADB 的来源、隔离和升级取舍见 [ADR-0002](docs/adr/0002-bundle-auditable-adb.md)，实时预览原型边界见 [ADR-0003](docs/adr/0003-prototype-webview2-h264-preview.md)，活动任务所有权见 [ADR-0004](docs/adr/0004-device-manager-owns-activity-runtime.md)，诊断日志边界见 [ADR-0005](docs/adr/0005-local-diagnostics.md)。
 
 ## 安全边界
 

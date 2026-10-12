@@ -24,6 +24,7 @@ use crate::activity::{
     recognize_popup,
 };
 use crate::click::{ClickTarget, FrameBounds, Point, sample_target};
+use crate::diagnostics;
 use crate::emulator_discovery::{
     DiscoveredMuMuInstance, LocalEmulatorDiscovery, MuMuDiscovery, SystemLocalEmulatorDiscovery,
 };
@@ -113,6 +114,20 @@ impl DeviceStatus {
             Self::Unknown => "unknown",
         }
     }
+}
+
+fn log_adb_source(source: AdbSource) {
+    let label = match source {
+        AdbSource::Saved => "saved",
+        AdbSource::Bundled => "bundled",
+        #[cfg(target_os = "windows")]
+        AdbSource::MuMu12 => "mumu12",
+        #[cfg(target_os = "windows")]
+        AdbSource::LdPlayer9 => "ldplayer9",
+        AdbSource::Path => "path",
+        AdbSource::Manual => "manual",
+    };
+    diagnostics::adb_source(label);
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -246,6 +261,8 @@ impl CommandRunner for ProcessRunner {
         args: &[String],
         limit: Duration,
     ) -> Result<CommandOutput, AppError> {
+        let started = std::time::Instant::now();
+        let class = diagnostics::command_class(args);
         let mut command = background_command(program);
         command
             .args(args)
@@ -254,22 +271,37 @@ impl CommandRunner for ProcessRunner {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let result = timeout(limit, command.output())
-            .await
-            .map_err(|_| {
-                AppError::new(
+        let result = match timeout(limit, command.output()).await {
+            Err(_) => {
+                diagnostics::command_result(class, limit, started.elapsed(), Err("ADB_TIMEOUT"));
+                return Err(AppError::new(
                     "ADB_TIMEOUT",
                     "ADB 操作超时",
                     "请确认模拟器仍在运行，然后重试",
-                )
-            })?
-            .map_err(|error| {
-                AppError::new(
+                ));
+            }
+            Ok(Err(error)) => {
+                diagnostics::command_result(class, limit, started.elapsed(), Err("ADB_NOT_FOUND"));
+                return Err(AppError::new(
                     "ADB_NOT_FOUND",
                     format!("无法启动 ADB：{error}"),
                     "请重新选择有效的 adb.exe",
-                )
-            })?;
+                ));
+            }
+            Ok(Ok(result)) => result,
+        };
+
+        diagnostics::command_result(
+            class,
+            limit,
+            started.elapsed(),
+            Ok(diagnostics::CommandResult {
+                success: result.status.success(),
+                exit_code: result.status.code(),
+                stdout: &result.stdout,
+                stderr: &result.stderr,
+            }),
+        );
 
         Ok(CommandOutput {
             success: result.status.success(),
@@ -589,18 +621,51 @@ impl DeviceManager {
     }
 
     pub async fn refresh_devices(&self) -> Result<AppState, AppError> {
-        let adb = self.selected_adb_path().await?;
+        let adb = diagnostics::step("selected_adb", self.selected_adb_path()).await?;
         self.ensure_bundled_server(&adb).await?;
-        let initial_devices = self.list_devices(&adb).await?;
+        let initial_devices = diagnostics::step("device_list", self.list_devices(&adb)).await?;
+        let discovery_started = std::time::Instant::now();
+        diagnostics::record("emulator_discovery", "start", None, None);
         let (attempted_discovery, warnings, discovered_mumu) = self
             .connect_discovered_mumu_devices(&adb, &initial_devices)
             .await;
+        diagnostics::record(
+            "emulator_discovery",
+            if warnings.is_empty() {
+                "success"
+            } else {
+                "failure"
+            },
+            if warnings.is_empty() {
+                None
+            } else {
+                Some("EMULATOR_DISCOVERY_PARTIAL")
+            },
+            Some(discovery_started.elapsed()),
+        );
         let devices = if attempted_discovery {
-            self.list_devices(&adb).await?
+            diagnostics::step("device_list", self.list_devices(&adb)).await?
         } else {
             initial_devices
         };
         let devices = enrich_devices(devices, &discovered_mumu);
+        if devices
+            .iter()
+            .any(|device| device.status == DeviceStatus::Offline)
+        {
+            diagnostics::record("device_status", "failure", Some("DEVICE_OFFLINE"), None);
+        }
+        if devices
+            .iter()
+            .any(|device| device.status == DeviceStatus::Unauthorized)
+        {
+            diagnostics::record(
+                "device_status",
+                "failure",
+                Some("DEVICE_UNAUTHORIZED"),
+                None,
+            );
+        }
 
         let mut state = self.state.write().await;
         let previous = state.active_device_serial.clone();
@@ -717,7 +782,7 @@ impl DeviceManager {
     }
 
     pub async fn connect_device(&self, endpoint: ConnectEndpoint) -> Result<AppState, AppError> {
-        let target = parse_endpoint(&endpoint)?;
+        let target = diagnostics::sync_step("endpoint_validation", || parse_endpoint(&endpoint))?;
         let adb = self.selected_adb_path().await?;
         self.ensure_bundled_server(&adb).await?;
         let args = self.adb_args(&adb, &["connect", &target]);
@@ -730,7 +795,9 @@ impl DeviceManager {
             "连接模拟器失败",
             "请检查 IP、端口和模拟器的 ADB 设置",
         )?;
-        ensure_connect_response(&output.stdout)?;
+        diagnostics::sync_step("connect_response", || {
+            ensure_connect_response(&output.stdout)
+        })?;
 
         {
             let mut state = self.state.write().await;
@@ -741,20 +808,24 @@ impl DeviceManager {
     }
 
     pub async fn select_device(&self, serial: String) -> Result<AppState, AppError> {
-        let available = self
-            .state
-            .read()
-            .await
-            .devices
-            .iter()
-            .any(|device| device.serial == serial && device.status == DeviceStatus::Online);
-        if !available {
-            return Err(AppError::new(
-                "DEVICE_NOT_READY",
-                "所选设备不在线",
-                "请刷新设备列表并选择在线设备",
-            ));
-        }
+        diagnostics::step("device_selection", async {
+            let available = self
+                .state
+                .read()
+                .await
+                .devices
+                .iter()
+                .any(|device| device.serial == serial && device.status == DeviceStatus::Online);
+            if !available {
+                return Err(AppError::new(
+                    "DEVICE_NOT_READY",
+                    "所选设备不在线",
+                    "请刷新设备列表并选择在线设备",
+                ));
+            }
+            Ok(())
+        })
+        .await?;
 
         if self.preview.active_device_serial().await.as_deref() != Some(&serial) {
             self.preview.stop().await;
@@ -772,7 +843,8 @@ impl DeviceManager {
     }
 
     pub async fn capture_screen(&self) -> Result<Vec<u8>, AppError> {
-        let (adb, serial) = self.active_command_context().await?;
+        let (adb, serial) =
+            diagnostics::step("active_device", self.active_command_context()).await?;
         self.ensure_bundled_server(&adb).await?;
         let args = self.adb_args(&adb, &["-s", &serial, "exec-out", "screencap", "-p"]);
         let output = self.runner.run(&adb, &args, ADB_TIMEOUT).await?;
@@ -784,7 +856,8 @@ impl DeviceManager {
             "截图失败",
             "请确认设备已解锁并保持在线",
         )?;
-        let (width, height) = validate_png(&output.stdout)?;
+        let (width, height) =
+            diagnostics::sync_step("png_validation", || validate_png(&output.stdout))?;
 
         let mut state = self.state.write().await;
         if state.active_device_serial.as_deref() != Some(&serial) {
@@ -809,38 +882,43 @@ impl DeviceManager {
         target: T,
     ) -> Result<TapReceipt, AppError> {
         let target = target.into();
-        let (adb, serial, frame, settings, generation, previous) = {
-            let state = self.state.read().await;
-            let adb = selected_path(&state)?;
-            let serial = state.active_device_serial.clone().ok_or_else(|| {
-                AppError::new("DEVICE_NOT_FOUND", "尚未选择活动设备", "请先选择在线设备")
-            })?;
-            let frame = state
-                .last_frame
-                .clone()
-                .filter(|frame| frame.device_serial == serial)
-                .ok_or_else(|| {
-                    AppError::new(
-                        "FRAME_REQUIRED",
-                        "点击前需要当前设备截图",
-                        "请先刷新截图并选择坐标",
-                    )
+        let (adb, serial, frame, settings, generation, previous) =
+            diagnostics::step("frame_validation", async {
+                let state = self.state.read().await;
+                if let Some(adb) = &state.selected_adb {
+                    log_adb_source(adb.source);
+                }
+                let adb = selected_path(&state)?;
+                let serial = state.active_device_serial.clone().ok_or_else(|| {
+                    AppError::new("DEVICE_NOT_FOUND", "尚未选择活动设备", "请先选择在线设备")
                 })?;
-            let previous = state
-                .last_click
-                .as_ref()
-                .filter(|(device, _)| device == &serial)
-                .map(|(_, point)| *point);
-            (
-                adb,
-                serial,
-                frame,
-                state.config.click_settings,
-                state.click_generation,
-                previous,
-            )
-        };
-        settings.validate()?;
+                let frame = state
+                    .last_frame
+                    .clone()
+                    .filter(|frame| frame.device_serial == serial)
+                    .ok_or_else(|| {
+                        AppError::new(
+                            "FRAME_REQUIRED",
+                            "点击前需要当前设备截图",
+                            "请先刷新截图并选择坐标",
+                        )
+                    })?;
+                let previous = state
+                    .last_click
+                    .as_ref()
+                    .filter(|(device, _)| device == &serial)
+                    .map(|(_, point)| *point);
+                state.config.click_settings.validate()?;
+                Ok((
+                    adb,
+                    serial,
+                    frame,
+                    state.config.click_settings,
+                    state.click_generation,
+                    previous,
+                ))
+            })
+            .await?;
         let (delay_ms, press_duration_ms, final_point) = {
             let mut rng = StdRng::seed_from_u64(self.activity_runtime.random_seed());
             let delay = rng.random_range(settings.delay_minimum_ms..=settings.delay_maximum_ms);
@@ -860,7 +938,7 @@ impl DeviceManager {
         self.activity_runtime
             .sleep(Duration::from_millis(delay_ms))
             .await;
-        {
+        diagnostics::step("post_delay_validation", async {
             let state = self.state.read().await;
             let valid = state.click_generation == generation
                 && state.active_device_serial.as_deref() == Some(&serial)
@@ -874,7 +952,9 @@ impl DeviceManager {
                     "设备、截图或点击配置已变化",
                 ));
             }
-        }
+            Ok(())
+        })
+        .await?;
         let x = final_point.x.to_string();
         let y = final_point.y.to_string();
         let duration = press_duration_ms.to_string();
@@ -1437,26 +1517,30 @@ impl DeviceManager {
         sink: PreviewSink,
         on_end: PreviewEndSink,
     ) -> Result<AppState, AppError> {
-        let (adb, serial) = self.active_command_context().await?;
-        self.ensure_bundled_server(&adb).await?;
-        let args = self.adb_args(
-            &adb,
-            &[
-                "-s",
-                &serial,
-                "exec-out",
-                "screenrecord",
-                "--output-format=h264",
-                "--size",
-                "1280x720",
-                "--bit-rate",
-                "8000000",
-                "-",
-            ],
-        );
-        self.preview
-            .start(&adb, &args, serial.clone(), sink, on_end)
-            .await?;
+        let serial = diagnostics::step("preview_backend", async {
+            let (adb, serial) = self.active_command_context().await?;
+            self.ensure_bundled_server(&adb).await?;
+            let args = self.adb_args(
+                &adb,
+                &[
+                    "-s",
+                    &serial,
+                    "exec-out",
+                    "screenrecord",
+                    "--output-format=h264",
+                    "--size",
+                    "1280x720",
+                    "--bit-rate",
+                    "8000000",
+                    "-",
+                ],
+            );
+            self.preview
+                .start(&adb, &args, serial.clone(), sink, on_end)
+                .await?;
+            Ok(serial)
+        })
+        .await?;
         let mut state = self.state.write().await;
         state.last_frame = Some(FrameSummary {
             width: 1280,
@@ -1469,7 +1553,11 @@ impl DeviceManager {
     }
 
     pub async fn stop_preview(&self) -> Result<AppState, AppError> {
-        self.preview.stop().await;
+        diagnostics::step("preview_backend", async {
+            self.preview.stop().await;
+            Ok(())
+        })
+        .await?;
         let mut state = self.state.write().await;
         state.last_frame = None;
         state.last_frame_bytes = None;
@@ -1478,88 +1566,95 @@ impl DeviceManager {
     }
 
     pub async fn shutdown(&self) -> Result<(), AppError> {
-        self.preview.stop().await;
-        let mut owned = self.bundled_server_owned.lock().await;
-        if !*owned {
-            return Ok(());
-        }
-        let Some(adb) = self.bundled_adb_path.as_deref() else {
-            return Ok(());
-        };
-        if let Err(error) = self.verify_bundled_server_identity(adb).await {
-            *owned = false;
-            return Err(error);
-        }
+        diagnostics::step("bundled_server_shutdown", async {
+            self.preview.stop().await;
+            let mut owned = self.bundled_server_owned.lock().await;
+            if !*owned {
+                return Ok(());
+            }
+            let Some(adb) = self.bundled_adb_path.as_deref() else {
+                return Ok(());
+            };
+            if let Err(error) = self.verify_bundled_server_identity(adb).await {
+                *owned = false;
+                return Err(error);
+            }
 
-        let args = self.adb_args(adb, &["kill-server"]);
-        let output = self.runner.run(adb, &args, ADB_TIMEOUT).await?;
-        ensure_success(
-            output.success,
-            &output.stdout,
-            &output.stderr,
-            "ADB_SHUTDOWN_FAILED",
-            "无法停止应用内置的 ADB 服务",
-            "请关闭残留的 adb.exe 后再卸载或升级",
-        )?;
-        *owned = false;
-        Ok(())
+            let args = self.adb_args(adb, &["kill-server"]);
+            let output = self.runner.run(adb, &args, ADB_TIMEOUT).await?;
+            ensure_success(
+                output.success,
+                &output.stdout,
+                &output.stderr,
+                "ADB_SHUTDOWN_FAILED",
+                "无法停止应用内置的 ADB 服务",
+                "请关闭残留的 adb.exe 后再卸载或升级",
+            )?;
+            *owned = false;
+            Ok(())
+        })
+        .await
     }
 
     async fn validate_adb(&self, path: &Path, source: AdbSource) -> Result<AdbCandidate, AppError> {
-        let bundled_distribution = if source == AdbSource::Bundled {
-            let distribution = parse_bundled_adb_distribution()?;
-            if self.bundled_adb_integrity == BundledAdbIntegrity::Verify {
-                validate_bundled_adb_files(path, &distribution)?;
+        log_adb_source(source);
+        diagnostics::step("adb_validation", async {
+            let bundled_distribution = if source == AdbSource::Bundled {
+                let distribution = parse_bundled_adb_distribution()?;
+                if self.bundled_adb_integrity == BundledAdbIntegrity::Verify {
+                    validate_bundled_adb_files(path, &distribution)?;
+                }
+                Some(distribution)
+            } else {
+                None
+            };
+
+            if !path.is_file() {
+                return Err(AppError::new(
+                    "ADB_INVALID",
+                    "所选路径不是 adb 可执行文件",
+                    "请选择 MuMu、雷电或 Android Platform-Tools 中的 adb.exe",
+                ));
             }
-            Some(distribution)
-        } else {
-            None
-        };
 
-        if !path.is_file() {
-            return Err(AppError::new(
+            let args = self.adb_args(path, &["version"]);
+            let output = self.runner.run(path, &args, ADB_TIMEOUT).await?;
+            ensure_success(
+                output.success,
+                &output.stdout,
+                &output.stderr,
                 "ADB_INVALID",
-                "所选路径不是 adb 可执行文件",
-                "请选择 MuMu、雷电或 Android Platform-Tools 中的 adb.exe",
-            ));
-        }
+                "无法验证所选 ADB",
+                "请选择可正常运行的 adb.exe",
+            )?;
+            let text = String::from_utf8_lossy(&output.stdout);
+            let version = parse_adb_version(&text).ok_or_else(|| {
+                AppError::new(
+                    "ADB_INVALID",
+                    "程序输出不符合 ADB 版本格式",
+                    "请选择 Android Debug Bridge 可执行文件",
+                )
+            })?;
+            if let Some(distribution) = bundled_distribution
+                && version.split('-').next() != Some(distribution.version.as_str())
+            {
+                return Err(AppError::new(
+                    "ADB_INVALID",
+                    format!(
+                        "应用内置 ADB 版本应为 {}，实际为 {version}",
+                        distribution.version
+                    ),
+                    "请重新安装应用，或手动选择一个有效的外部 adb.exe",
+                ));
+            }
 
-        let args = self.adb_args(path, &["version"]);
-        let output = self.runner.run(path, &args, ADB_TIMEOUT).await?;
-        ensure_success(
-            output.success,
-            &output.stdout,
-            &output.stderr,
-            "ADB_INVALID",
-            "无法验证所选 ADB",
-            "请选择可正常运行的 adb.exe",
-        )?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        let version = parse_adb_version(&text).ok_or_else(|| {
-            AppError::new(
-                "ADB_INVALID",
-                "程序输出不符合 ADB 版本格式",
-                "请选择 Android Debug Bridge 可执行文件",
-            )
-        })?;
-        if let Some(distribution) = bundled_distribution
-            && version.split('-').next() != Some(distribution.version.as_str())
-        {
-            return Err(AppError::new(
-                "ADB_INVALID",
-                format!(
-                    "应用内置 ADB 版本应为 {}，实际为 {version}",
-                    distribution.version
-                ),
-                "请重新安装应用，或手动选择一个有效的外部 adb.exe",
-            ));
-        }
-
-        Ok(AdbCandidate {
-            path: path.to_string_lossy().into_owned(),
-            source,
-            version,
+            Ok(AdbCandidate {
+                path: path.to_string_lossy().into_owned(),
+                source,
+                version,
+            })
         })
+        .await
     }
 
     fn adb_args(&self, path: &Path, args: &[&str]) -> Vec<String> {
@@ -1579,36 +1674,40 @@ impl DeviceManager {
     }
 
     async fn ensure_bundled_server(&self, path: &Path) -> Result<(), AppError> {
-        if !self.is_bundled_adb(path) {
-            return Ok(());
-        }
-
-        let mut owned = self.bundled_server_owned.lock().await;
-        if *owned {
-            return Ok(());
-        }
-
-        if let Err(port_error) = ensure_bundled_server_port_available(self.bundled_server_port) {
-            if self.verify_bundled_server_identity(path).await.is_ok() {
-                *owned = true;
+        diagnostics::step("bundled_server", async {
+            if !self.is_bundled_adb(path) {
                 return Ok(());
             }
-            return Err(port_error);
-        }
 
-        let args = self.adb_args(path, &["start-server"]);
-        let output = self.runner.run(path, &args, ADB_TIMEOUT).await?;
-        ensure_success(
-            output.success,
-            &output.stdout,
-            &output.stderr,
-            "BUNDLED_ADB_START_FAILED",
-            "无法启动应用内置的 ADB 服务",
-            "请重试，或选择一个外部 adb.exe",
-        )?;
-        self.verify_bundled_server_identity(path).await?;
-        *owned = true;
-        Ok(())
+            let mut owned = self.bundled_server_owned.lock().await;
+            if *owned {
+                return Ok(());
+            }
+
+            if let Err(port_error) = ensure_bundled_server_port_available(self.bundled_server_port)
+            {
+                if self.verify_bundled_server_identity(path).await.is_ok() {
+                    *owned = true;
+                    return Ok(());
+                }
+                return Err(port_error);
+            }
+
+            let args = self.adb_args(path, &["start-server"]);
+            let output = self.runner.run(path, &args, ADB_TIMEOUT).await?;
+            ensure_success(
+                output.success,
+                &output.stdout,
+                &output.stderr,
+                "BUNDLED_ADB_START_FAILED",
+                "无法启动应用内置的 ADB 服务",
+                "请重试，或选择一个外部 adb.exe",
+            )?;
+            self.verify_bundled_server_identity(path).await?;
+            *owned = true;
+            Ok(())
+        })
+        .await
     }
 
     async fn verify_bundled_server_identity(&self, adb: &Path) -> Result<(), AppError> {
@@ -1653,11 +1752,17 @@ impl DeviceManager {
 
     async fn selected_adb_path(&self) -> Result<PathBuf, AppError> {
         let state = self.state.read().await;
+        if let Some(adb) = &state.selected_adb {
+            log_adb_source(adb.source);
+        }
         selected_path(&state)
     }
 
     async fn active_command_context(&self) -> Result<(PathBuf, String), AppError> {
         let state = self.state.read().await;
+        if let Some(adb) = &state.selected_adb {
+            log_adb_source(adb.source);
+        }
         let adb = selected_path(&state)?;
         let serial = state.active_device_serial.clone().ok_or_else(|| {
             AppError::new(
