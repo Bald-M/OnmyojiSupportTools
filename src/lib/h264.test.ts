@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { AnnexBAccessUnitParser } from './h264'
+import { AnnexBAccessUnitParser, H264CanvasDecoder } from './h264'
+
+afterEach(() => {
+  vi.restoreAllMocks()
+  vi.unstubAllGlobals()
+})
 
 describe('Annex B H.264 access-unit parser', () => {
   it('keeps split NAL units until the next start code arrives', () => {
@@ -46,4 +51,32 @@ describe('Annex B H.264 access-unit parser', () => {
     expect(units).toHaveLength(1)
     expect(units[0]?.type).toBe('key')
   })
+})
+
+it('reports the average rate of frames actually drawn to the canvas', () => {
+  let output: VideoDecoderInit['output'] = () => {}
+  vi.stubGlobal('VideoDecoder', class {
+    state = 'configured'
+    constructor(callbacks: VideoDecoderInit) { output = callbacks.output }
+    close() { this.state = 'closed' }
+  })
+  let now = 0
+  vi.spyOn(performance, 'now').mockImplementation(() => now)
+  const drawImage = vi.fn()
+  const canvas = { getContext: () => ({ drawImage }), width: 0, height: 0 } as unknown as HTMLCanvasElement
+  const onRate = vi.fn()
+  const decoder = new H264CanvasDecoder(canvas, vi.fn(), onRate)
+  const frame = { displayWidth: 1280, displayHeight: 720, close: vi.fn() } as unknown as VideoFrame
+
+  output(frame)
+  now = 500
+  output(frame)
+  expect(onRate).not.toHaveBeenCalled()
+  now = 1000
+  output(frame)
+
+  expect(drawImage).toHaveBeenCalledTimes(3)
+  expect(frame.close).toHaveBeenCalledTimes(3)
+  expect(onRate).toHaveBeenCalledWith(2, 3)
+  decoder.close()
 })
