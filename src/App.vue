@@ -85,6 +85,8 @@ const status = reactive<{ tone: StatusTone; message: string; recovery: string | 
 })
 let stageResizeObserver: ResizeObserver | null = null
 let previewDecoder: H264CanvasDecoder | null = null
+const previewAverageFps = ref<number | null>(null)
+const previewFrameCount = ref(0)
 let previewFailurePending = false
 let activityTimer: number | null = null
 let tapCountdownTimer: number | null = null
@@ -488,6 +490,8 @@ function handleResumeConfirm() { void runOperation('activity', resumeActivity, (
 function closePreviewDecoder() {
   previewDecoder?.close()
   previewDecoder = null
+  previewAverageFps.value = null
+  previewFrameCount.value = 0
 }
 
 async function recoverFromPreviewFailure(message: string) {
@@ -622,9 +626,14 @@ function handleCapture() {
 function handlePreviewChunk(chunk: Uint8Array) {
   if (!previewCanvas.value) return
   try {
-    previewDecoder ??= new H264CanvasDecoder(previewCanvas.value, (error) => {
-      void recoverFromPreviewFailure(`实时预览解码失败：${error.message}`)
-    })
+    previewDecoder ??= new H264CanvasDecoder(
+      previewCanvas.value,
+      (error) => { void recoverFromPreviewFailure(`实时预览解码失败：${error.message}`) },
+      (averageFps, frameCount) => {
+        previewAverageFps.value = averageFps
+        previewFrameCount.value = frameCount
+      },
+    )
     previewDecoder.push(chunk)
   } catch (error) {
     const message = error instanceof Error ? error.message : '实时预览解码失败'
@@ -894,6 +903,9 @@ onBeforeUnmount(() => {
           <div>
             <h2>设备画面</h2>
             <p>{{ appState.activeDeviceSerial || '选择设备后获取截图' }}</p>
+            <p v-if="appState.previewDeviceSerial && previewAverageFps !== null" data-testid="preview-fps">
+              已绘制 {{ previewFrameCount }} 帧 · 平均 {{ previewAverageFps.toFixed(1) }} FPS
+            </p>
           </div>
           <div class="frame-actions">
             <button

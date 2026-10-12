@@ -127,8 +127,15 @@ export class H264CanvasDecoder {
   private configuredCodec: string | null = null
   private timestamp = 0
   private waitingForKeyFrame = false
+  private firstFrameAt: number | null = null
+  private lastRateReportAt = 0
+  private frameCount = 0
 
-  constructor(canvas: HTMLCanvasElement, onError: (error: Error) => void) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    onError: (error: Error) => void,
+    onFrameRate?: (averageFps: number, frameCount: number) => void,
+  ) {
     const context = canvas.getContext('2d')
     if (!context || typeof VideoDecoder === 'undefined') {
       throw new Error('当前 WebView2 不支持 H.264 WebCodecs 解码')
@@ -139,6 +146,16 @@ export class H264CanvasDecoder {
         canvas.height = frame.displayHeight
         context.drawImage(frame, 0, 0, canvas.width, canvas.height)
         frame.close()
+        const now = performance.now()
+        if (this.firstFrameAt === null) {
+          this.firstFrameAt = now
+          this.lastRateReportAt = now
+        }
+        this.frameCount += 1
+        if (now - this.lastRateReportAt >= 1000) {
+          onFrameRate?.((this.frameCount - 1) * 1000 / (now - this.firstFrameAt), this.frameCount)
+          this.lastRateReportAt = now
+        }
       },
       error: (error) => {
         this.waitingForKeyFrame = true
